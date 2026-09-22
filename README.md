@@ -21,9 +21,6 @@ This package contains no recordings, screenshots, personal Foundry endpoint, or 
 
 1. Replace the placeholder values in the repository-root `.env`, or copy `.env.example` to `.env` and edit it. Use the **project endpoint**, not a model endpoint. The resource, project, and agent names need not match. Sample content:
 
-# Local configuration template. Replace these placeholders before running RSR.
-# Never commit a .env file containing your real endpoint or other private values.
-
 PROJECT_ENDPOINT=https://YOUR-RESOURCE.services.ai.azure.com/api/projects/YOUR-PROJECT
 AGENT_NAME=YOUR-AGENT-NAME
 
