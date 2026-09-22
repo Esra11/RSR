@@ -1,4 +1,4 @@
-# RSR
+# RSR (Record, Summarize, Replay)
 
 RSR records a Windows workflow, generates a step-by-step PDF with screenshots, and creates a plan to replay the workflow later. You can add an intent note when an action needs more explanation or should adapt on future runs.
 
