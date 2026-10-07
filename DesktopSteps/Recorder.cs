@@ -6,12 +6,15 @@ using System.Windows.Automation;
 
 namespace DesktopSteps;
 
+// Captures low-level input promptly and enriches it with accessibility evidence off
+// the hook thread. Ordered delivery prevents slow UIA providers from reordering the
+// user's actions, while unresolved identities remain explicit instead of being guessed.
 internal sealed class Recorder : IDisposable
 {
     private const int WH_KEYBOARD_LL = 13, WH_MOUSE_LL = 14;
     private const int WM_KEYDOWN = 0x100, WM_SYSKEYDOWN = 0x104, WM_LBUTTONDOWN = 0x201,
         WM_LBUTTONUP = 0x202,
-        WM_RBUTTONDOWN = 0x204, WM_MOUSEWHEEL = 0x20A, WM_MOUSEHWHEEL = 0x20E;
+        WM_RBUTTONDOWN = 0x204, WM_RBUTTONUP = 0x205, WM_MOUSEWHEEL = 0x20A, WM_MOUSEHWHEEL = 0x20E;
     private readonly List<RecordedEvent> events = [];
     private readonly HashSet<string> ignoredProcesses = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<Task> pendingScrollCaptures = [];
@@ -21,18 +24,51 @@ internal sealed class Recorder : IDisposable
     private sealed record RowAnchorSnapshot(int Row, string Current, string Next, string Following);
     private readonly Dictionary<string, (DateTimeOffset At, Task<RowAnchorSnapshot?> Capture)> rowAnchorCaptures =
         new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<nint, (DateTime At, NativeRect WindowBounds, List<(string Name, string Type, System.Windows.Rect Bounds)> Controls)> dialogControlCache = [];
+    private readonly Dictionary<nint, (DateTime At, NativeRect WindowBounds,
+        List<(string Name, string Type, System.Windows.Rect Bounds, ControlRef Target)> Controls)> dialogControlCache = [];
     private readonly HashSet<nint> queuedDialogSnapshots = [];
+    private readonly Dictionary<nint, int> dialogCacheVersions = [];
     private readonly object dialogCacheLock = new();
     private readonly Dictionary<nint, (AutomationElement Root, AutomationEventHandler Invoked,
         AutomationEventHandler Selected)> dialogActionHandlers = [];
     private readonly Channel<Action> enrichmentQueue = Channel.CreateUnbounded<Action>(
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
     private readonly Task enrichmentWorker;
+    private readonly Control hookDispatcher = new();
+    private readonly OrderedCaptureQueue inputDeliveries = new();
+    private Thread? hookThread;
+    private Control? hookLoop;
     private readonly HookProc keyboardProc, mouseProc;
     private readonly System.Windows.Forms.Timer typingCapture = new() { Interval = 450 };
     private readonly System.Windows.Forms.Timer clickCapture = new() { Interval = 400 };
     private readonly System.Windows.Forms.Timer scrollCapture = new() { Interval = 500 };
+    private readonly System.Windows.Forms.Timer chartHoverCapture = new() { Interval = 150 };
+    private readonly AutoResetEvent chartSampleRequested = new(false);
+    private Thread? chartSampleThread;
+    private volatile bool chartSampleStopping;
+    private volatile bool chartSamplePaused;
+    private long chartInputGeneration;
+    private readonly System.Windows.Forms.Timer legendOutcomeCapture = new() { Interval = 300 };
+    private Action? pendingLegendOutcome;
+    private readonly System.Collections.Concurrent.ConcurrentQueue<string> captureDiagnostics = new();
+    private bool captureDiagnosticsSaved;
+
+    private void CaptureDiagnostic(string message)
+    {
+        if (captureDiagnostics.Count < 2000)
+            captureDiagnostics.Enqueue($"{DateTimeOffset.Now:O} {message}");
+    }
+
+    private T MeasureCapture<T>(string stage, Func<T> capture)
+    {
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        try { return capture(); }
+        finally
+        {
+            if (watch.ElapsedMilliseconds >= 100)
+                CaptureDiagnostic($"{stage}: {watch.ElapsedMilliseconds} ms");
+        }
+    }
     private nint keyboardHook, mouseHook;
     private string? directory;
     private int imageNumber;
@@ -40,6 +76,23 @@ internal sealed class Recorder : IDisposable
     private AutomationElement? scrollElement;
     private int scrollEventIndex = -1;
     private int pendingClickIndex = -1;
+    private int dragClickIndex = -1;
+    private System.Drawing.Point dragClickPoint;
+    private string? dragChartName;
+    private nint dragChartWindow;
+    private string? dragChartSheet;
+    private ExcelNativeSheet.LegendLayout? dragLegendBefore;
+    private sealed record HoveredChart(DateTimeOffset At, System.Windows.Rect Bounds, MouseDownSnapshot Snapshot);
+    private volatile HoveredChart? hoveredChart;
+    private sealed record PointerMenu(DateTimeOffset At, long Generation, nint Foreground,
+        MouseDownSnapshot Snapshot);
+    private volatile PointerMenu[]? pointerMenus;
+    private readonly List<Task> pendingMenuCaptures = [];
+    private volatile bool chartPointerDown;
+    private sealed record ChartSourceCapture(nint Window, ControlRef Target, string? Sheet,
+        ExcelNativeSheet.ChartSource? Before);
+    private volatile ChartSourceCapture? chartSourceCapture;
+    private long lastChartInputTick;
     private Screen? pendingClickScreen;
     private System.Drawing.Point? pendingClickPoint;
     private nint pendingClickWindow;
@@ -50,7 +103,9 @@ internal sealed class Recorder : IDisposable
     private string resizeEdge = "right";
     private bool scrollDragPending;
     private string? scrollAxis;
-    private bool capturePausedForIntent;
+    private volatile bool capturePausedForIntent;
+    private volatile bool capturePausedByUser;
+    private int finishingTypingCapture;
     private nint intentDialogWindow;
     private nint cachedKeyboardFocus, cachedKeyboardWindow;
     private nint lastForegroundWindow;
@@ -60,11 +115,46 @@ internal sealed class Recorder : IDisposable
     private AutomationElement? cachedEditableElement;
     private Screen? cachedEditableScreen;
     public bool IsRecording => keyboardHook != 0 || mouseHook != 0;
+    public bool IsPaused => IsRecording && capturePausedByUser;
     public IReadOnlyList<RecordedEvent> Events => events;
     public event Action<RecordedEvent>? Captured;
     public event Action<nint>? IntentRequested;
     public event Action<ControlRef>? TargetCorrected;
-    public event Action? IntentCancelRequested;
+    public event Action<int, string>? UnresolvedDialogClick;
+
+    public bool IsUnresolvedDialogClick(int index)
+    {
+        lock (events)
+            return index >= 0 && index < events.Count &&
+                (events[index].Kind == "unresolved-click" || IsUnresolvedDialogEvent(events[index]));
+    }
+
+    public string DescribeRecovery(int index)
+    {
+        lock (events)
+        {
+            if (index < 0 || index >= events.Count)
+                return "The affected action is no longer present in this recording.";
+            static string Describe(RecordedEvent item) =>
+                $"{item.At:HH:mm:ss.fff}: {item.Kind} " +
+                $"'{item.Target?.Name ?? item.Key ?? "(unidentified control)"}' " +
+                $"in '{item.Target?.Window ?? "(unknown window)"}'";
+            var item = events[index];
+            return $"Repeat from recorded action {index + 1} ({Describe(item)}).\n" +
+                (index > 0 ? $"Last kept action {index}: {Describe(events[index - 1])}.\n" : "") +
+                $"Affected range: actions {index + 1}-{events.Count}, through {events[^1].At:HH:mm:ss.fff}.\n" +
+                string.Join("\n", events.Skip(index + 1).Take(5)
+                    .Select((following, offset) => $"Also repeat action {index + offset + 2}: {Describe(following)}.")) +
+                (events.Count - index > 6 ? "\nRepeat the remaining later actions as well." : "");
+        }
+    }
+
+    private static bool IsUnresolvedDialogEvent(RecordedEvent item) =>
+        item.Kind == "click" && item.AfterState is not
+            ("dialog-command" or "dialog-command-result" or "window-closed" or
+             "dialog-result-acknowledgement" or "worksheet-tab-focus-only") &&
+        item.Target is { Name.Length: > 0, ControlType: "ControlType.Window" or
+            "ControlType.Custom" or "ControlType.Tab" };
 
     public void SetIgnoredProcesses(IEnumerable<string> processes)
     {
@@ -98,6 +188,7 @@ internal sealed class Recorder : IDisposable
 
     public Recorder()
     {
+        hookDispatcher.CreateControl();
         enrichmentWorker = Task.Run(async () =>
         {
             await foreach (var action in enrichmentQueue.Reader.ReadAllAsync())
@@ -108,20 +199,38 @@ internal sealed class Recorder : IDisposable
         typingCapture.Tick += (_, _) => FinishTypingCapture();
         clickCapture.Tick += (_, _) => FinishPendingClick();
         scrollCapture.Tick += (_, _) => CompleteScroll();
+        chartHoverCapture.Tick += (_, _) =>
+        {
+            CompleteChartSourceCapture();
+            chartSamplePaused = capturePausedByUser || capturePausedForIntent || pendingLegendOutcome is not null;
+            chartSampleRequested.Set();
+        };
+        legendOutcomeCapture.Tick += (_, _) => FinishLegendOutcome();
     }
 
     public void Start(string outputDirectory)
     {
         if (keyboardHook != 0 || mouseHook != 0) throw new InvalidOperationException("Already recording.");
+        if (pendingMenuCaptures.Any(task => !task.IsCompleted))
+            throw new InvalidOperationException("The previous context-menu capture has not stopped.");
+        pendingMenuCaptures.Clear();
+        pointerMenus = null;
+        Interlocked.Increment(ref chartInputGeneration);
         directory = outputDirectory;
+        captureDiagnostics.Clear();
+        captureDiagnosticsSaved = false;
         Directory.CreateDirectory(outputDirectory);
         events.Clear(); imageNumber = 0;
+        capturePausedByUser = false;
         cachedKeyboardFocus = cachedKeyboardWindow = 0;
         lastForegroundWindow = 0;
         cachedKeyboardTarget = null; cachedKeyboardScreen = null;
         cachedEditableTarget = null; cachedEditableScreen = null;
         cachedEditableElement = null;
         pendingClickIndex = -1; pendingClickScreen = null; pendingClickPoint = null;
+        dragClickIndex = -1; dragChartName = null; dragLegendBefore = null;
+        hoveredChart = null; chartPointerDown = false;
+        chartSourceCapture = null;
         pendingClickWindow = 0; pendingClickTabBefore = null;
         pendingClickFocusBefore = null;
         resizeStartIndex = -1;
@@ -130,23 +239,87 @@ internal sealed class Recorder : IDisposable
         pendingWindowCaptures.Clear();
         pendingProbeCaptures.Clear();
         rowAnchorCaptures.Clear();
-        lock (dialogCacheLock) { dialogControlCache.Clear(); queuedDialogSnapshots.Clear(); }
+        lock (dialogCacheLock)
+        {
+            dialogControlCache.Clear();
+            queuedDialogSnapshots.Clear();
+            dialogCacheVersions.Clear();
+        }
         RemoveDialogActionHandlers();
-        keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, keyboardProc, 0, 0);
-        mouseHook = SetWindowsHookEx(WH_MOUSE_LL, mouseProc, 0, 0);
-        if (keyboardHook == 0 || mouseHook == 0) { Stop(); throw new System.ComponentModel.Win32Exception(); }
+        CompleteChartSourceCapture();
+        StartChartSampling(PrimeHoveredChart);
+        chartHoverCapture.Start();
+        using var ready = new ManualResetEventSlim();
+        Exception? hookError = null;
+        hookThread = new Thread(() =>
+        {
+            using var loop = new Control();
+            loop.CreateControl();
+            hookLoop = loop;
+            using var dialogs = new System.Windows.Forms.Timer { Interval = 150 };
+            dialogs.Tick += (_, _) => PrimeVisibleDialogCaches();
+            keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, keyboardProc, 0, 0);
+            mouseHook = SetWindowsHookEx(WH_MOUSE_LL, mouseProc, 0, 0);
+            if (keyboardHook == 0 || mouseHook == 0)
+                hookError = new System.ComponentModel.Win32Exception();
+            ready.Set();
+            try
+            {
+                if (hookError is null)
+                {
+                    dialogs.Start();
+                    Application.Run();
+                }
+            }
+            finally
+            {
+                if (keyboardHook != 0) UnhookWindowsHookEx(keyboardHook);
+                if (mouseHook != 0) UnhookWindowsHookEx(mouseHook);
+                keyboardHook = mouseHook = 0;
+                hookLoop = null;
+            }
+        }) { IsBackground = true, Name = "RSR input hooks" };
+        hookThread.SetApartmentState(ApartmentState.STA);
+        hookThread.Start();
+        ready.Wait();
+        if (hookError is not null)
+        {
+            hookThread.Join();
+            hookThread = null;
+            chartHoverCapture.Stop();
+            StopChartSampling();
+            throw hookError;
+        }
     }
 
     public void Stop()
     {
+        Interlocked.Increment(ref chartInputGeneration);
+        pointerMenus = null;
+        chartHoverCapture.Stop();
+        chartSampleStopping = true;
+        chartSampleRequested.Set();
+        capturePausedByUser = false;
         capturePausedForIntent = false;
         intentDialogWindow = 0;
-        FinishTypingCapture();
-        FinishPendingClick();
-        CompleteScroll();
         if (keyboardHook != 0) UnhookWindowsHookEx(keyboardHook);
         if (mouseHook != 0) UnhookWindowsHookEx(mouseHook);
         keyboardHook = mouseHook = 0;
+        if (hookLoop is { } loop && !loop.IsDisposed)
+            loop.BeginInvoke(new Action(Application.ExitThread));
+        if (hookThread is not null)
+        {
+            if (!hookThread.Join(TimeSpan.FromSeconds(10)))
+                throw new TimeoutException("Recording hooks did not stop within ten seconds.");
+            hookThread = null;
+        }
+        inputDeliveries.Drain();
+        StopChartSampling();
+        FinishLegendOutcome();
+        FinishTypingCapture();
+        FinishPendingClick();
+        CompleteChartSourceCapture();
+        CompleteScroll();
         RemoveDialogActionHandlers();
         try { Task.WaitAll(pendingScrollCaptures.ToArray()); }
         catch (AggregateException ex) { System.Diagnostics.Trace.WriteLine(ex); }
@@ -160,18 +333,248 @@ internal sealed class Recorder : IDisposable
         try { Task.WaitAll(pendingProbeCaptures.ToArray(), TimeSpan.FromSeconds(15)); }
         catch (AggregateException ex) { System.Diagnostics.Trace.WriteLine(ex); }
         pendingProbeCaptures.Clear();
+        if (!Task.WaitAll(pendingMenuCaptures.ToArray(), TimeSpan.FromSeconds(10)))
+            throw new TimeoutException("Context-menu accessibility capture did not stop within ten seconds.");
+        pendingMenuCaptures.Clear();
         var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         if (enrichmentQueue.Writer.TryWrite(() => drained.TrySetResult()))
             drained.Task.Wait(TimeSpan.FromSeconds(10));
         RemoveDialogActionHandlers();
+        if (directory is not null && !captureDiagnosticsSaved)
+        {
+            File.WriteAllLines(Path.Combine(directory, "capture_diagnostics.log"), captureDiagnostics.ToArray());
+            captureDiagnosticsSaved = true;
+        }
     }
 
     private nint OnMouse(int code, nint message, nint data)
     {
-        if (capturePausedForIntent) return CallNextHookEx(0, code, message, data);
+        if (code >= 0 && message == WM_RBUTTONUP && !capturePausedByUser && !capturePausedForIntent)
+        {
+            var generation = Interlocked.Read(ref chartInputGeneration);
+            var foreground = GetForegroundWindow();
+            hookDispatcher.BeginInvoke(new Action(() =>
+            {
+                if (!IsRecording || generation != Interlocked.Read(ref chartInputGeneration)) return;
+                pendingMenuCaptures.RemoveAll(task => task.IsCompleted);
+                pendingMenuCaptures.Add(CaptureReleasedContextMenuAsync(foreground, generation));
+            }));
+            return CallNextHookEx(0, code, message, data);
+        }
+        if (capturePausedByUser || capturePausedForIntent || code < 0 ||
+            message is not (WM_LBUTTONDOWN or WM_LBUTTONUP or WM_RBUTTONDOWN or WM_MOUSEWHEEL or WM_MOUSEHWHEEL))
+            return CallNextHookEx(0, code, message, data);
+        var sequence = inputDeliveries.Reserve();
+        var actions = new List<Action>();
+        try { return OnMouseCore(code, message, data, actions.Add); }
+        catch (ArgumentException ex)
+        {
+            System.Diagnostics.Trace.WriteLine("Mouse accessibility capture: " + ex);
+            actions.Add(() => Add(new(DateTimeOffset.Now,
+                "unresolved-input", null, null, null, null, null, null,
+                Diagnostic: "The accessibility provider returned invalid control bounds during mouse capture: " +
+                    ex.Message + " No target was guessed.")));
+            return CallNextHookEx(0, code, message, data);
+        }
+        finally
+        {
+            inputDeliveries.Enqueue(sequence, () =>
+            {
+                foreach (var action in actions) action();
+            });
+            hookDispatcher.BeginInvoke(new Action(inputDeliveries.Drain));
+        }
+    }
+
+    private nint OnMouseCore(int code, nint message, nint data, Action<Action> dispatch)
+    {
+        if (capturePausedByUser || capturePausedForIntent || code < 0)
+            return CallNextHookEx(0, code, message, data);
+        if (message is not (WM_LBUTTONDOWN or WM_LBUTTONUP or WM_RBUTTONDOWN or
+            WM_MOUSEWHEEL or WM_MOUSEHWHEEL))
+            return CallNextHookEx(0, code, message, data);
+        var info = Marshal.PtrToStructure<MouseInfo>(data);
+        var generationBeforeInput = Interlocked.Read(ref chartInputGeneration);
+        var menuBeforeInput = pointerMenus;
+        if (message is WM_LBUTTONDOWN or WM_RBUTTONDOWN or WM_MOUSEWHEEL or WM_MOUSEHWHEEL)
+        {
+            pointerMenus = null;
+            Interlocked.Increment(ref chartInputGeneration);
+        }
+        var at = InputTimestamp(unchecked((uint)info.Time));
+        if (chartSourceCapture is { Target.ProcessId: > 0 } pendingSource)
+        {
+            GetWindowThreadProcessId(GetForegroundWindow(), out var foregroundProcessId);
+            if (foregroundProcessId == pendingSource.Target.ProcessId)
+                Interlocked.Exchange(ref lastChartInputTick, Environment.TickCount64);
+        }
+        var menusAtPoint = menuBeforeInput?.Where(candidate =>
+            candidate.Snapshot.InputBounds.Contains(info.Point.X, info.Point.Y)).Take(2).ToArray();
+        var menu = menusAtPoint is { Length: 1 } ? menusAtPoint[0] : null;
+        if (message == WM_LBUTTONDOWN && menu is not null &&
+            IsPointerMenuFresh(menu, at, generationBeforeInput, GetForegroundWindow(), info.Point.X, info.Point.Y) &&
+            IsWindowVisible(menu.Snapshot.WindowHandle) &&
+            GetAncestor(WindowFromPoint(new(info.Point.X, info.Point.Y)), 2) == menu.Snapshot.WindowHandle)
+        {
+            CaptureDiagnostic("mouse-hook: menu identity frozen before click");
+            dispatch(() => ProcessMouse(code, message, info, null, null,
+                menu.Snapshot.Target, menu.Snapshot, at));
+            return CallNextHookEx(0, code, message, data);
+        }
+        if (chartSourceCapture is { } chartEdit && message is WM_LBUTTONDOWN or WM_RBUTTONDOWN &&
+            GetForegroundWindow() is var dialogWindow &&
+            NativeControlRef(dialogWindow, null, "", "ControlType.Window", null) is
+                { Process: "EXCEL", Window: "Select Data Source" } dialogOwner &&
+            dialogOwner.ProcessId == chartEdit.Target.ProcessId)
+        {
+            Interlocked.Exchange(ref lastChartInputTick, Environment.TickCount64);
+            dispatch(() =>
+            {
+                dragClickIndex = -1;
+                dragChartName = null;
+                dragLegendBefore = null;
+                Add(new(at, "chart-source-edit-input",
+                    dialogOwner, null, null, null, null, null,
+                    Diagnostic: "Chart source dialog input; replay requires its verified final source outcome."));
+            });
+            return CallNextHookEx(0, code, message, data);
+        }
+        if (message is WM_MOUSEWHEEL or WM_MOUSEHWHEEL)
+        {
+            var axis = message == WM_MOUSEHWHEEL ? "Horizontal" : "Vertical";
+            var target = CaptureWheelTarget(info.Point.X, info.Point.Y, axis);
+            var delta = unchecked((short)((uint)info.MouseData >> 16)).ToString();
+            dispatch(() =>
+            {
+                if (target is null)
+                {
+                    Add(new RecordedEvent(at, "unresolved-input", null, delta, axis, null, null, null,
+                        Diagnostic: "The wheel window could not be identified at input time. " +
+                            "Re-record this section; no target was guessed."));
+                    return;
+                }
+                ProcessWheel(at, target, delta, axis, info.Point.X, info.Point.Y);
+            });
+            return CallNextHookEx(0, code, message, data);
+        }
+        var cachedChart = hoveredChart;
+        if (message is WM_LBUTTONDOWN or WM_RBUTTONDOWN) chartPointerDown = true;
+        if (message == WM_LBUTTONUP) chartPointerDown = false;
+        if (message is WM_LBUTTONDOWN or WM_RBUTTONDOWN && cachedChart is not null &&
+            at >= cachedChart.At && at - cachedChart.At < TimeSpan.FromMilliseconds(500) &&
+            cachedChart.Bounds.Contains(info.Point.X, info.Point.Y) &&
+            (WindowFromPoint(new(info.Point.X, info.Point.Y)) == cachedChart.Snapshot.HitWindow ||
+                GetAncestor(WindowFromPoint(new(info.Point.X, info.Point.Y)), 2) == cachedChart.Snapshot.WindowHandle))
+        {
+            dispatch(() =>
+                ProcessMouse(code, message, info, null, null, null, cachedChart.Snapshot, at));
+            return CallNextHookEx(0, code, message, data);
+        }
+        // Resolve Excel's transient filter checklist before the general UIA
+        // probes. Its provider can be slow, and running this specialized MSAA
+        // capture last allowed a valid checklist click to disappear first.
+        var filterTarget = message != WM_LBUTTONUP
+            ? MeasureCapture("mouse-hook filter hit", () => CaptureFilterItemAtPoint(info.Point.X, info.Point.Y))
+            : null;
+        var mouseDownTarget = message != WM_LBUTTONUP
+            ? filterTarget ??
+                MeasureCapture("mouse-hook direct menu hit", () => CaptureDirectMenuAtPoint(info.Point.X, info.Point.Y)) ??
+                MeasureCapture("mouse-hook owned popup command", () => CaptureOwnedPopupCommandAtPoint(info.Point.X, info.Point.Y)) ??
+                MeasureCapture("mouse-hook cached dialog hit", () => CachedDialogCommandAtPoint(info.Point.X, info.Point.Y)) ??
+                MeasureCapture("mouse-hook native dialog hit", () => CaptureNativeDialogCommandAtPoint(info.Point.X, info.Point.Y)) ??
+                MeasureCapture("mouse-hook UIA hit", () => CaptureMouseDownTarget(info.Point.X, info.Point.Y)) : null;
+        if (mouseDownTarget is { IsDialog: true, Target.ControlType: "ControlType.Button" or
+                "ControlType.RadioButton" or "ControlType.CheckBox" or "ControlType.TabItem" or
+                "ControlType.Edit" } && message == WM_LBUTTONDOWN)
+        {
+            if (mouseDownTarget.Target.ControlType == "ControlType.TabItem")
+                InvalidateDialogCache(mouseDownTarget.WindowHandle);
+            dispatch(() =>
+                ProcessMouse(code, message, info, null, null, null, mouseDownTarget, at));
+            return CallNextHookEx(0, code, message, data);
+        }
+        // Popup menus can disappear or switch branches before the UI-thread recorder
+        // processes the queued mouse event. Freeze the MSAA identity at mouse-down,
+        // with a popup-only UIA fallback; screenshots and enrichment remain queued.
+        var transientMenu = message == WM_LBUTTONDOWN
+            && mouseDownTarget?.Target.ControlType != "ControlType.MenuItem"
+            ? MsaaCommandAtPoint(info.Point.X, info.Point.Y) : null;
+        var transientMenuParent = transientMenu is { Type: "ControlType.MenuItem" }
+            ? MsaaActions.MenuParentAtPoint(info.Point.X, info.Point.Y) : null;
+        var transientMenuTarget = mouseDownTarget?.Target.ControlType == "ControlType.MenuItem"
+            ? mouseDownTarget.Target
+            : transientMenu is { Type: "ControlType.MenuItem" } command
+            ? NativeControlRef(WindowFromPoint(new System.Drawing.Point(info.Point.X, info.Point.Y)),
+                null, command.Name, command.Type, null) is { } menuTarget
+                ? menuTarget with { ParentName = transientMenuParent } : null
+            : null;
+        transientMenuTarget ??= message == WM_LBUTTONDOWN
+            ? CapturePopupMenuTarget(info.Point.X, info.Point.Y) : null;
+        dispatch(() =>
+            ProcessMouse(code, message, info, transientMenu, transientMenuParent, transientMenuTarget,
+                mouseDownTarget, at));
+        return CallNextHookEx(0, code, message, data);
+    }
+
+    private static ControlRef? CaptureWheelTarget(int x, int y, string axis)
+    {
+        var point = new System.Drawing.Point(x, y);
+        // A transient native scroll/tooltip window can disappear between queries.
+        // Retry the live hit test, never reuse the previous event's application.
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var pointer = WindowFromPoint(point);
+            if (pointer == 0) continue;
+            var root = GetAncestor(pointer, 2);
+            if (root == 0) root = pointer;
+            var target = NativeControlRef(root, null, "", "ControlType.ScrollBar", null) ??
+                NativeControlRef(pointer, null, "", "ControlType.ScrollBar", null);
+            if (target is not null) return target with { Orientation = axis };
+        }
+        return null;
+    }
+
+    private void ProcessWheel(DateTimeOffset at, ControlRef target, string delta, string axis, int x, int y)
+    {
+        if (IsOwnWindow(target) || IsIgnored(target)) return;
+        FinishPendingClick();
+        FinishTypingCapture();
+        if (scrollEventIndex >= 0 && !scrollDragPending && events[scrollEventIndex].Key == axis &&
+            events[scrollEventIndex].Target?.Process == target.Process &&
+            events[scrollEventIndex].Target?.Window == target.Window &&
+            int.TryParse(events[scrollEventIndex].Value, out var previous))
+            events[scrollEventIndex] = events[scrollEventIndex] with
+                { Value = (previous + int.Parse(delta)).ToString() };
+        else
+        {
+            CompleteScroll();
+            Add(new(at, "scroll", target, delta, axis, null, null, null,
+                Diagnostic: "Wheel application and axis frozen through native window identity."));
+            scrollEventIndex = events.Count - 1;
+            scrollElement = null;
+            scrollScreen = Screen.FromPoint(new System.Drawing.Point(x, y));
+            scrollAxis = axis;
+        }
+        scrollCapture.Stop();
+        scrollCapture.Start();
+    }
+
+    private void ProcessMouse(int code, nint message, MouseInfo info,
+        (string Name, string Type, int X, int Y, int Width, int Height)? transientMenu,
+        string? transientMenuParent, ControlRef? transientMenuTarget,
+        MouseDownSnapshot? mouseDownTarget, DateTimeOffset at)
+    {
+        if (message == WM_LBUTTONDOWN)
+        {
+            dragClickIndex = -1; dragChartName = null; dragLegendBefore = null;
+        }
+        // Provider latency does not invalidate a click. This callback completes
+        // before Windows delivers the click to the target application, so the
+        // live resolution below still observes the clicked surface. The former
+        // age check converted slow but valid Excel clicks into unresolved input.
         if (code >= 0 && message == WM_LBUTTONUP && resizeStartIndex >= 0)
         {
-            var release = Marshal.PtrToStructure<MouseInfo>(data).Point;
+            var release = info.Point;
             var index = resizeStartIndex;
             resizeStartIndex = -1;
             var dx = release.X - resizeStartPoint.X;
@@ -193,13 +596,67 @@ internal sealed class Recorder : IDisposable
             scrollDragPending = false;
             scrollCapture.Stop(); scrollCapture.Start();
         }
+        if (code >= 0 && message == WM_LBUTTONUP && dragClickIndex >= 0)
+        {
+            var index = dragClickIndex;
+            dragClickIndex = -1;
+            if (index < events.Count && events[index].Kind == "click" &&
+                (Math.Abs(info.Point.X - dragClickPoint.X) >= 6 || Math.Abs(info.Point.Y - dragClickPoint.Y) >= 6))
+            {
+                var recorded = events[index];
+                clickCapture.Stop();
+                if (pendingClickIndex == index) pendingClickIndex = -1;
+                var chartName = dragChartName;
+                var chartSheet = dragChartSheet;
+                var chartWindow = dragChartWindow;
+                var legendBefore = dragLegendBefore;
+                var outcomeScreen = pendingClickScreen;
+                FinishLegendOutcome();
+                chartSamplePaused = true;
+                pendingLegendOutcome = () =>
+                {
+                try
+                {
+                    if (chartName is null || chartSheet is null || legendBefore is null || recorded.Target is null)
+                        throw new InvalidOperationException("No supported semantic resize outcome was captured for this drag.");
+                    var after = ExcelNativeSheet.Read<ExcelNativeSheet.LegendLayout>(chartWindow, sheet =>
+                    {
+                        if ((string)sheet.Name != chartSheet)
+                            throw new InvalidOperationException("The chart sheet changed during drag capture.");
+                        return ExcelNativeSheet.ReadLegendLayout(sheet, chartName);
+                    });
+                    if (Math.Abs(after.Width - legendBefore.Width) < .005 &&
+                        Math.Abs(after.Height - legendBefore.Height) < .005 &&
+                        Math.Abs(after.Left - legendBefore.Left) < .005 &&
+                        Math.Abs(after.Top - legendBefore.Top) < .005)
+                        throw new InvalidOperationException("The drag's legend layout change could not be verified. " +
+                            $"Before: {legendBefore}; after: {after}.");
+                    recorded = recorded with { Kind = "set-chart-legend-layout",
+                        Target = recorded.Target with { Name = chartName, ControlType = "ControlType.Image", AutomationId = "" },
+                        Value = System.Text.Json.JsonSerializer.Serialize(after),
+                        BeforeState = System.Text.Json.JsonSerializer.Serialize(legendBefore),
+                        AfterState = "chart-legend-sheet:" + chartSheet, Screenshot = Capture(outcomeScreen),
+                        Diagnostic = "Legend layout captured before and after drag; replay uses chart-relative dimensions, not pointer coordinates." };
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or COMException)
+                {
+                    recorded = recorded with { Kind = "unresolved-input", Diagnostic = ex.Message,
+                        AfterState = null, Screenshot = Capture(outcomeScreen) };
+                }
+                lock (events) events[index] = recorded;
+                Captured?.Invoke(recorded);
+                };
+                legendOutcomeCapture.Start();
+            }
+            dragChartName = null; dragLegendBefore = null;
+        }
         if (code >= 0 && (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN ||
             message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL))
         {
             var precedingRowMenu = message == WM_LBUTTONDOWN && events.Count > 0 &&
                 events[^1].Kind == "context-click" &&
                 events[^1].Target?.ClassName == "XLGridRowHeader" &&
-                DateTimeOffset.Now - events[^1].At < TimeSpan.FromSeconds(8);
+                at - events[^1].At < TimeSpan.FromSeconds(8);
             if (precedingRowMenu)
             {
                 // A popup menu can vanish on mouse-up. Finishing the previous
@@ -217,9 +674,49 @@ internal sealed class Recorder : IDisposable
             FinishTypingCapture();
             cachedEditableTarget = null; cachedEditableElement = null;
             cachedKeyboardTarget = null; cachedKeyboardScreen = null; // Pointer may change focus.
-            var info = Marshal.PtrToStructure<MouseInfo>(data);
             try
             {
+                if (message == WM_LBUTTONDOWN && transientMenuTarget is not null)
+                {
+                    // Use the identity frozen at mouse-down. Re-hit-testing here
+                    // can see another item after the popup closes or changes branch.
+                    if (!IsOwnWindow(transientMenuTarget) && !IsIgnored(transientMenuTarget) &&
+                        !IsIgnoredForeground())
+                        Add(new RecordedEvent(at, "click", transientMenuTarget,
+                            null, null, Capture(Screen.FromPoint(
+                                new System.Drawing.Point(info.Point.X, info.Point.Y))),
+                            null, "msaa-menu-item", ClickX: info.Point.X, ClickY: info.Point.Y,
+                            Diagnostic: "Menu identity captured synchronously at mouse-down."));
+                    return;
+                }
+                if (message == WM_LBUTTONDOWN && mouseDownTarget is
+                    { IsDialog: true, Target.ControlType: "ControlType.Button" or
+                        "ControlType.RadioButton" or "ControlType.CheckBox" or "ControlType.TabItem" or
+                        "ControlType.Edit" } dialogClick)
+                {
+                    var frozen = dialogClick.Target;
+                    if (IsOwnWindow(frozen) || IsIgnored(frozen) || IsIgnoredForeground()) return;
+                    Add(new RecordedEvent(at, "click", frozen, null, null,
+                        Capture(Screen.FromPoint(new System.Drawing.Point(info.Point.X, info.Point.Y))),
+                        null, null, ClickX: info.Point.X, ClickY: info.Point.Y,
+                        Diagnostic: "Control identity verified at mouse-down."));
+                    var capturedIndex = events.Count - 1;
+                    if (frozen.Window == "Find and Replace")
+                        QueueDialogFieldSnapshot(capturedIndex, dialogClick.WindowHandle);
+                    if (frozen.ControlType == "ControlType.TabItem")
+                        RefreshDialogCacheAfterTab(dialogClick.WindowHandle);
+                    if (frozen.ControlType == "ControlType.Edit")
+                    {
+                        cachedEditableTarget = frozen;
+                        cachedEditableElement = dialogClick.Element;
+                        cachedEditableScreen = Screen.FromHandle(dialogClick.WindowHandle);
+                        cachedKeyboardWindow = dialogClick.WindowHandle;
+                        cachedKeyboardFocus = 0;
+                    }
+                    if (frozen.ControlType == "ControlType.Button")
+                        QueueNativeCloseConfirmation(capturedIndex, dialogClick.WindowHandle);
+                    return;
+                }
                 if (precedingRowMenu)
                 {
                     var rowTarget = events.LastOrDefault(item => item.Kind == "context-click" &&
@@ -231,12 +728,12 @@ internal sealed class Recorder : IDisposable
                         {
                             var menuTarget = rowTarget with { Name = menu.Name, ControlType = menu.Type,
                                 AutomationId = null, ClassName = null, ParentName = null };
-                            Add(new RecordedEvent(DateTimeOffset.Now, "click", menuTarget, null, null,
+                            Add(new RecordedEvent(at, "click", menuTarget, null, null,
                                 null, null, "msaa-menu-item", ClickX: info.Point.X, ClickY: info.Point.Y));
                         }
                         else
                         {
-                            var unresolved = new RecordedEvent(DateTimeOffset.Now, "unresolved-click",
+                            var unresolved = new RecordedEvent(at, "unresolved-click",
                                 rowTarget with { Name = "row menu choice", ControlType = "ControlType.Window",
                                     AutomationId = null, ClassName = null, ParentName = null },
                                 null, null, null, null, "menu choice was not identified",
@@ -248,6 +745,8 @@ internal sealed class Recorder : IDisposable
                             Add(unresolved);
                             int unresolvedIndex;
                             lock (events) unresolvedIndex = events.FindIndex(item => ReferenceEquals(item, unresolved));
+                            UnresolvedDialogClick?.Invoke(unresolvedIndex,
+                                rowTarget.Window ?? rowTarget.Name ?? "context menu");
                             QueueRowMenuDiagnostic(unresolvedIndex, info.Point.X, info.Point.Y, unresolved.At);
                             var key = rowTarget.Window + "/" + rowTarget.Name;
                             if (rowAnchorCaptures.TryGetValue(key, out var cached) &&
@@ -267,24 +766,38 @@ internal sealed class Recorder : IDisposable
                             }
                         }
                     }
-                    return CallNextHookEx(0, code, message, data);
+                    return;
                 }
                 if (!precedingRowMenu) PrimeDialogCache(CompactWindowAtPoint(info.Point.X, info.Point.Y));
-                if (message == WM_LBUTTONDOWN &&
+                if (mouseDownTarget is null && message == WM_LBUTTONDOWN &&
                     TryRecordNativeDialogClick(info.Point.X, info.Point.Y))
-                    return CallNextHookEx(0, code, message, data);
+                    return;
                 var native = message == WM_LBUTTONDOWN
                     ? FindNativeActionableAtPoint(info.Point.X, info.Point.Y) : null;
-                var hit = native is null
-                    ? AutomationElement.FromPoint(new System.Windows.Point(info.Point.X, info.Point.Y))
-                    : AutomationElement.FromHandle(native.Value.Handle);
-                if (hit is null) return CallNextHookEx(0, code, message, data);
+                var compactWindow = CompactWindowAtPoint(info.Point.X, info.Point.Y);
+                // Hook points and UIA FromPoint both use physical screen coordinates.
+                var automationPoint = new System.Drawing.Point(info.Point.X, info.Point.Y);
+                var hit = mouseDownTarget?.Element ?? (native is null
+                    ? AutomationElement.FromPoint(new System.Windows.Point(automationPoint.X, automationPoint.Y))
+                    : AutomationElement.FromHandle(native.Value.Handle));
+                if (hit is null) return;
                 var compactClick = message == WM_LBUTTONDOWN &&
                     IsCompactForegroundWindow(info.Point.X, info.Point.Y);
-                var element = compactClick
-                    ? FindActionableControlAtPoint(hit, info.Point.X, info.Point.Y) ?? hit : hit;
-                var target = Automation.Describe(element);
-                if (compactClick && target?.ControlType is "ControlType.DataItem" or "ControlType.ListItem")
+                var element = mouseDownTarget?.Element ?? (compactClick
+                    ? FindActionableControlAtPoint(hit, automationPoint.X, automationPoint.Y) ?? hit : hit);
+                var target = mouseDownTarget?.Target ?? Automation.Describe(element);
+                if (message == WM_LBUTTONDOWN && target is not null &&
+                    transientMenu is { Type: "ControlType.MenuItem" } liveMenu)
+                    target = target with
+                    {
+                        Name = liveMenu.Name,
+                        ControlType = liveMenu.Type,
+                        AutomationId = null,
+                        ClassName = null,
+                        ParentName = transientMenuParent ?? Automation.MenuParentName(element)
+                    };
+                if (mouseDownTarget is null && compactClick &&
+                    target?.ControlType is "ControlType.DataItem" or "ControlType.ListItem")
                     target = CorrectCompactListWindow(target, info.Point.X, info.Point.Y);
                 string? desktopHitDiagnostic = null;
                 if (IsDesktopBackground(target))
@@ -372,16 +885,18 @@ internal sealed class Recorder : IDisposable
                 var cachedAction = compactClick && native is null &&
                     target?.ControlType is "ControlType.Window" or "ControlType.Pane" or "ControlType.Custom"
                     ? CachedDialogControlAtPoint(info.Point.X, info.Point.Y) : null;
-                if (native is { Name: { Length: > 0 } } button && target is not null &&
+                if (mouseDownTarget is null && native is { Name: { Length: > 0 } } button && target is not null &&
                     (target.ControlType is not ("ControlType.Button" or "ControlType.TabItem") ||
                      !string.Equals(target.Name, button.Name, StringComparison.OrdinalIgnoreCase)))
                     target = target with { Name = button.Name,
                         ControlType = button.ClassName.Equals("Button", StringComparison.OrdinalIgnoreCase)
                             ? NativeButtonControlType(button.Handle) : "ControlType.TabItem" };
-                else if (cachedAction is { } action && target is not null &&
+                else if (mouseDownTarget is null && cachedAction is { } action && target is not null &&
                     target.ControlType is "ControlType.Window" or "ControlType.Pane" or "ControlType.Custom")
                     target = target with { Name = action.Name, ControlType = action.Type,
-                        AutomationId = null, ClassName = null, ParentName = null };
+                        AutomationId = null, ClassName = null,
+                        ParentName = action.Type == "ControlType.MenuItem"
+                            ? transientMenuParent ?? Automation.MenuParentName(element) : null };
                 nint dialogRoot = 0;
                 if (target is not null && compactClick)
                 {
@@ -397,11 +912,52 @@ internal sealed class Recorder : IDisposable
                         dialogRoot = ResolveDialogWindow(CompactWindowAtPoint(info.Point.X, info.Point.Y),
                             target, null, null);
                 }
+                if (message == WM_LBUTTONDOWN && target is not null && dialogRoot != 0 &&
+                    target.ControlType is "ControlType.Window" or "ControlType.Pane" or
+                        "ControlType.Custom" or "ControlType.Tab")
+                {
+                    // Identify transient native and MSAA commands before the click changes
+                    // or closes the dialog. The point is recording evidence only; replay
+                    // receives the resulting accessibility identity and never these coordinates.
+                    var rawPoint = new System.Drawing.Point(info.Point.X, info.Point.Y);
+                    var uiaAction = FindDialogActionableAtPoint(dialogRoot, rawPoint.X, rawPoint.Y);
+                    var nativeAction = uiaAction is null ? FindNativeActionableAtPoint(dialogRoot,
+                        rawPoint.X, rawPoint.Y, 0x20, 80) : null;
+                    var accessibleAction = uiaAction is null && nativeAction is null
+                        ? MsaaActions.CommandAtPoint(dialogRoot, rawPoint.X, rawPoint.Y)
+                        : null;
+                    if (uiaAction is not null || nativeAction is not null || accessibleAction is not null)
+                    {
+                        var actionType = nativeAction is not null
+                            ? nativeAction.Value.ClassName.Contains("Tab",
+                                StringComparison.OrdinalIgnoreCase)
+                                ? "ControlType.TabItem" : "ControlType.Button"
+                            : accessibleAction?.Type;
+                        var actionName = nativeAction?.Name ?? accessibleAction?.Name;
+                        target = uiaAction ??
+                            (actionName is not null && actionType is not null
+                                ? NativeControlRef(dialogRoot, null, actionName, actionType, null)
+                                : null) ?? target;
+                    }
+                }
                 if (message == WM_LBUTTONDOWN && target is not null &&
                     NativeCloseAtPoint(CompactWindowAtPoint(info.Point.X, info.Point.Y), info.Point.X, info.Point.Y))
                     target = target with { Name = "Close", ControlType = "ControlType.Button" };
                 if (target is not null && !IsOwnWindow(target) && !IsIgnored(target) && !IsIgnoredForeground())
                 {
+                    if (message == WM_RBUTTONDOWN && target.Process == "EXCEL" &&
+                        target.ControlType == "ControlType.Image" && !string.IsNullOrWhiteSpace(target.Name) &&
+                        (target.ClassName == "ExcelChartObject" ||
+                            target.ParentName?.StartsWith("Sheet ", StringComparison.Ordinal) == true))
+                    {
+                        var chartSheet = mouseDownTarget?.ChartSheet ??
+                            (target.ParentName?.StartsWith("Sheet ", StringComparison.Ordinal) == true
+                                ? target.ParentName["Sheet ".Length..] : null);
+                        target = target with { ClassName = "ExcelChartObject" };
+                        chartSourceCapture = new(mouseDownTarget?.WindowHandle ??
+                            GetAncestor(WindowFromPoint(new(info.Point.X, info.Point.Y)), 2),
+                            target, chartSheet, mouseDownTarget?.ChartSource);
+                    }
                     var screen = Screen.FromPoint(new System.Drawing.Point(info.Point.X, info.Point.Y));
                     if (!searchForegroundMismatch && IsEditableTarget(target, element))
                     {
@@ -429,7 +985,7 @@ internal sealed class Recorder : IDisposable
                         else
                         {
                             CompleteScroll();
-                            Add(new(DateTimeOffset.Now, "scroll", target, delta, axis, null,
+                            Add(new(at, "scroll", target, delta, axis, null,
                                 Automation.ScrollState(element), null));
                             scrollEventIndex = events.Count - 1;
                             scrollElement = element;
@@ -444,12 +1000,60 @@ internal sealed class Recorder : IDisposable
                     {
                         var before = searchForegroundMismatch || target.Window == "Find and Replace"
                             ? null : Automation.State(element);
-                        Add(new(DateTimeOffset.Now, searchForegroundMismatch ? "unresolved-click" :
+                        Add(new(at, searchForegroundMismatch ? "unresolved-click" :
                             message == WM_RBUTTONDOWN ? "context-click" : "click",
                             target, null, null, null, before,
                             message == WM_RBUTTONDOWN ? SelectionCount(element) : null,
                             ClickX: info.Point.X, ClickY: info.Point.Y,
-                            Diagnostic: desktopHitDiagnostic));
+                            Diagnostic: mouseDownTarget is not null &&
+                                !IsWeakClickTarget(target)
+                                ? "Control identity verified at mouse-down." : desktopHitDiagnostic));
+                        if (message == WM_LBUTTONDOWN)
+                        {
+                            dragClickPoint = new(info.Point.X, info.Point.Y);
+                            dragChartName = null; dragLegendBefore = null;
+                            if (target.Process == "EXCEL")
+                            {
+                                try
+                                {
+                                    if (target.ClassName == "ExcelChartObject")
+                                        dragChartName = target.Name;
+                                    var ancestor = element;
+                                    for (var depth = 0; dragChartName is null && ancestor is not null && depth < 10; depth++)
+                                    {
+                                        if (ancestor.Current.ControlType == System.Windows.Automation.ControlType.Image &&
+                                            !string.IsNullOrWhiteSpace(ancestor.Current.Name))
+                                        {
+                                            dragChartName = ancestor.Current.Name;
+                                            break;
+                                        }
+                                        ancestor = TreeWalker.RawViewWalker.GetParent(ancestor);
+                                    }
+                                    if (dragChartName is not null)
+                                    {
+                                        dragClickIndex = events.Count - 1;
+                                        var root = GetAncestor(WindowFromPoint(dragClickPoint), 2);
+                                        dragChartWindow = root;
+                                        dragLegendBefore = mouseDownTarget?.LegendBefore;
+                                        dragChartSheet = mouseDownTarget?.ChartSheet;
+                                        if (dragLegendBefore is null)
+                                        {
+                                            // The known-working recorder sampled this state directly at
+                                            // mouse-down. Keep the hover cache as the fast path, but never
+                                            // discard a valid drag merely because that cache was late.
+                                            dragLegendBefore = ExcelNativeSheet.Read<ExcelNativeSheet.LegendLayout>(root,
+                                                sheet =>
+                                                {
+                                                    dragChartSheet = (string)sheet.Name;
+                                                    return ExcelNativeSheet.ReadLegendLayout(sheet, dragChartName);
+                                                });
+                                        }
+                                    }
+                                }
+                                catch (Exception ex) when (ex is InvalidOperationException or COMException)
+                                { System.Diagnostics.Trace.WriteLine(ex); dragLegendBefore = null; }
+                            }
+                        }
                         if (searchForegroundMismatch)
                         {
                             QueueSearchResultRetry(events.Count - 1, info.Point.X, info.Point.Y);
@@ -503,7 +1107,7 @@ internal sealed class Recorder : IDisposable
                             }));
                         }
                         if (message == WM_LBUTTONDOWN && target.Name is { Length: > 0 } &&
-                            target.ControlType is "ControlType.DataItem" or "ControlType.HeaderItem")
+                            target.ClassName == "XLGridColumnHeader")
                         {
                             var bounds = element.Current.BoundingRectangle;
                             if (!bounds.IsEmpty && bounds.Height is >= 8 and <= 60 &&
@@ -567,7 +1171,7 @@ internal sealed class Recorder : IDisposable
                                         last = direction;
                                         if (stable >= 3 && direction != priorDirection) break;
                                     }
-                                    if (last is not null && last != priorDirection)
+                                    if (last is not null && stable >= 3)
                                         lock (events) events[index] = events[index] with { AfterState = "sort:" + last };
                                 }
                                 catch (Exception ex) { System.Diagnostics.Trace.WriteLine(ex); }
@@ -577,42 +1181,155 @@ internal sealed class Recorder : IDisposable
                 }
             }
             catch (Exception ex) { System.Diagnostics.Trace.WriteLine(ex); }
+            finally { if (message == WM_RBUTTONDOWN) chartPointerDown = false; }
         }
-        return CallNextHookEx(0, code, message, data);
+        return;
     }
 
     private nint OnKeyboard(int code, nint message, nint data)
     {
-        if (capturePausedForIntent)
+        if (capturePausedByUser || capturePausedForIntent || code < 0 ||
+            message is not (WM_KEYDOWN or WM_SYSKEYDOWN))
+            return CallNextHookEx(0, code, message, data);
+        var sequence = inputDeliveries.Reserve();
+        var actions = new List<Action>();
+        try { return OnKeyboardCore(code, message, data, actions.Add); }
+        finally
         {
-            if (code >= 0 && (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
-                (intentDialogWindow == 0 || GetForegroundWindow() != intentDialogWindow))
+            inputDeliveries.Enqueue(sequence, () =>
             {
-                if (Marshal.PtrToStructure<KeyboardInfo>(data).VirtualKey == (uint)Keys.Escape)
-                    IntentCancelRequested?.Invoke();
-                return 1; // Keep accidental typing out of the desktop; mouse input is never blocked.
-            }
+                foreach (var action in actions) action();
+            });
+            hookDispatcher.BeginInvoke(new Action(inputDeliveries.Drain));
+        }
+    }
+
+    private nint OnKeyboardCore(int code, nint message, nint data, Action<Action> dispatch)
+    {
+        if (capturePausedByUser || capturePausedForIntent || code < 0)
+            return CallNextHookEx(0, code, message, data);
+        if (message != WM_KEYDOWN && message != WM_SYSKEYDOWN)
+            return CallNextHookEx(0, code, message, data);
+        var info = Marshal.PtrToStructure<KeyboardInfo>(data);
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+            info.VirtualKey == (uint)Keys.I && KeyDown(Keys.ControlKey) &&
+            KeyDown(Keys.Menu) && KeyDown(Keys.ShiftKey))
+        {
+            capturePausedForIntent = true;
+            var previousWindow = GetForegroundWindow();
+            dispatch(() => IntentRequested?.Invoke(previousWindow));
+            return 1;
+        }
+        if (info.VirtualKey is (uint)Keys.ShiftKey or (uint)Keys.LShiftKey or (uint)Keys.RShiftKey or
+            (uint)Keys.ControlKey or (uint)Keys.LControlKey or (uint)Keys.RControlKey or
+            (uint)Keys.Menu or (uint)Keys.LMenu or (uint)Keys.RMenu)
+            return CallNextHookEx(0, code, message, data);
+        var owner = DescribeNativeWindowOwner(GetForegroundWindow());
+        if (owner is not null && (ignoredProcesses.Contains(owner) ||
+            owner.Equals(Path.GetFileNameWithoutExtension(Environment.ProcessPath), StringComparison.OrdinalIgnoreCase)))
+            return CallNextHookEx(0, code, message, data);
+        Interlocked.Increment(ref chartInputGeneration);
+        var modifiers = CurrentModifiers();
+        var at = InputTimestamp(info.Time);
+        if (chartSourceCapture is { Target.ProcessId: > 0 } pendingSource)
+        {
+            GetWindowThreadProcessId(GetForegroundWindow(), out var foregroundProcessId);
+            if (foregroundProcessId == pendingSource.Target.ProcessId)
+                Interlocked.Exchange(ref lastChartInputTick, Environment.TickCount64);
+        }
+        // Low-level hook timestamps can already be old when a provider held the
+        // hook thread. Windows has not delivered this key to the application yet,
+        // so age alone must not discard its current foreground/focus identity.
+        var inputOwner = NativeControlRef(GetForegroundWindow(), null, "", "ControlType.Window", null);
+        if (chartSourceCapture is not { } pendingChart ||
+            inputOwner is not { Process: "EXCEL", Window: "Select Data Source" } ||
+            inputOwner.ProcessId != pendingChart.Target.ProcessId)
+            inputOwner = null;
+        if (inputOwner is not null)
+        {
+            var dialogOwner = inputOwner;
+            Interlocked.Exchange(ref lastChartInputTick, Environment.TickCount64);
+            dispatch(() => Add(new(at, "chart-source-edit-input",
+                dialogOwner, null, null, null, null, null,
+                Diagnostic: "Chart source dialog input; replay requires its verified final source outcome.")));
             return CallNextHookEx(0, code, message, data);
         }
-        if (code >= 0 && (message == WM_KEYDOWN || message == WM_SYSKEYDOWN))
+        var snapshot = inputOwner is null ? CaptureKeyboardTarget() : null;
+        dispatch(() => ProcessKeyboard(message, info, modifiers, at, snapshot, inputOwner));
+        return CallNextHookEx(0, code, message, data);
+    }
+
+    private static DateTimeOffset InputTimestamp(uint time) =>
+        DateTimeOffset.Now - TimeSpan.FromMilliseconds(unchecked((uint)Environment.TickCount64 - time));
+
+    private void RecordDelayedInput(DateTimeOffset at, string input, ControlRef? owner = null) =>
+        Add(new RecordedEvent(at, "unresolved-input", owner, null, null, null, null, null,
+            Diagnostic: $"The {input} input identity could not be frozen before delayed processing. Re-record this section; no target was guessed."));
+
+    private sealed record KeyboardSnapshot(nint Window, nint Focus, ControlRef? Target,
+        AutomationElement? Element, Screen Screen);
+
+    private static KeyboardSnapshot? CaptureKeyboardTarget()
+    {
+        var window = GetForegroundWindow();
+        var focus = ForegroundFocusHandle();
+        try
+        {
+            if (TryDescribeNativeEdit(window, focus, out var native) && native is not null)
+                return new(window, focus, (GetWindowLong(focus, -16) & 0x20) != 0 ? null : native,
+                    null, Screen.FromHandle(window));
+            var element = AutomationElement.FocusedElement;
+            if (element is null) return null;
+            if (element.Current.IsPassword)
+                return new(window, focus, null, null, Screen.FromHandle(window));
+            var current = element.Current;
+            GetWindowThreadProcessId(window, out var owner);
+            if (current.ProcessId != owner && !IsHostedElementInWindow(element, window)) return null;
+            var target = NativeControlRef(window, current.AutomationId, current.Name,
+                current.ControlType.ProgrammaticName, current.ClassName);
+            if (target is null) return null;
+            target = target with { Process = System.Diagnostics.Process.GetProcessById(current.ProcessId).ProcessName,
+                ParentName = TreeWalker.ControlViewWalker.GetParent(element)?.Current.Name,
+                ProcessId = current.ProcessId };
+            return new(window, focus, target, element, Screen.FromHandle(window));
+        }
+
+        catch (Exception ex) when (ex is ElementNotAvailableException or ArgumentException or InvalidOperationException or
+            System.Runtime.InteropServices.COMException)
+        { System.Diagnostics.Trace.WriteLine(ex); return null; }
+    }
+
+    private static bool IsHostedElementInWindow(AutomationElement element, nint window)
+    {
+        for (var depth = 0; depth < 32; depth++)
+        {
+            var handle = (nint)element.Current.NativeWindowHandle;
+            if (handle != 0 && (handle == window || GetAncestor(handle, 2) == window)) return true;
+            var parent = TreeWalker.RawViewWalker.GetParent(element);
+            if (parent is null) return false;
+            element = parent;
+        }
+        return false;
+    }
+
+    private void ProcessKeyboard(nint message, KeyboardInfo info, string modifiers,
+        DateTimeOffset at, KeyboardSnapshot? snapshot, ControlRef? inputOwner)
+    {
+        if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN)
         {
             try
             {
-                var info = Marshal.PtrToStructure<KeyboardInfo>(data);
                 var keyCode = (int)info.VirtualKey;
+                if (snapshot is null)
+                {
+                    RecordDelayedInput(at, "keyboard", inputOwner);
+                    return;
+                }
+                if (snapshot.Target is null) return;
                 if (keyCode is (int)Keys.Tab or (int)Keys.F6)
                     FinishTypingCapture();
-                if (keyCode == (int)Keys.I && KeyDown(Keys.ControlKey) &&
-                    KeyDown(Keys.Menu) && KeyDown(Keys.ShiftKey))
-                {
-                    FinishTypingCapture();
-                    capturePausedForIntent = true;
-                    try { IntentRequested?.Invoke(GetForegroundWindow()); }
-                    catch { capturePausedForIntent = false; throw; }
-                    return 1; // The shortcut opens a note; it is not sent to the recorded app.
-                }
-                var foreground = GetForegroundWindow();
-                var focus = ForegroundFocusHandle();
+                var foreground = snapshot.Window;
+                var focus = snapshot.Focus;
                 // Resolve the focused editor once after a click or focus change.
                 // The control under the pointer can be the dialog pane instead of
                 // the field receiving the keystrokes.
@@ -629,55 +1346,23 @@ internal sealed class Recorder : IDisposable
                     cachedEditableElement = null; // Keyboard navigation can change fields without a click.
                     cachedKeyboardTarget = null;
                 }
-                ControlRef? target = null;
-                Screen? targetScreen = null;
-                if ((cachedEditableTarget is not null && foreground == cachedKeyboardWindow) ||
-                    (focus == cachedKeyboardFocus && foreground == cachedKeyboardWindow &&
-                     cachedKeyboardTarget is not null))
+                var target = snapshot.Target;
+                var targetScreen = snapshot.Screen;
+                cachedKeyboardFocus = focus;
+                cachedKeyboardWindow = foreground;
+                cachedKeyboardTarget = target;
+                cachedKeyboardScreen = targetScreen;
+                cachedEditableTarget = IsEditableTarget(target, snapshot.Element) ? target : null;
+                cachedEditableElement = cachedEditableTarget is null ? null : snapshot.Element;
+                cachedEditableScreen = cachedEditableTarget is null ? null : targetScreen;
+                if (!IsOwnWindow(target) && !IsIgnored(target))
                 {
-                    target = cachedEditableTarget is not null && foreground == cachedKeyboardWindow
-                        ? cachedEditableTarget : cachedKeyboardTarget;
-                    targetScreen = cachedEditableTarget is not null && foreground == cachedKeyboardWindow
-                        ? cachedEditableScreen : cachedKeyboardScreen;
-                }
-                if (target is null)
-                {
-                    if (TryDescribeNativeEdit(foreground, focus, out var nativeEdit))
-                    {
-                        target = nativeEdit;
-                        targetScreen = Screen.FromHandle(foreground);
-                        cachedKeyboardFocus = focus;
-                        cachedKeyboardWindow = foreground;
-                        cachedKeyboardTarget = target;
-                        cachedKeyboardScreen = targetScreen;
-                        cachedEditableTarget = target;
-                        cachedEditableElement = null;
-                        cachedEditableScreen = targetScreen;
-                    }
-                    else if (AutomationElement.FocusedElement is { } element && !element.Current.IsPassword)
-                    {
-                        target = Automation.Describe(element);
-                        targetScreen = ScreenFor(element);
-                        cachedKeyboardFocus = focus;
-                        cachedKeyboardWindow = foreground;
-                        cachedKeyboardTarget = target;
-                        cachedKeyboardScreen = targetScreen;
-                        cachedEditableTarget = target is not null &&
-                            (target.ControlType == "ControlType.Edit" || target.ClassName == "EDTBX" ||
-                             target.ControlType == "ControlType.Pane" && !string.IsNullOrEmpty(target.AutomationId) ||
-                             element.TryGetCurrentPattern(ValuePattern.Pattern, out _)) ? target : null;
-                        cachedEditableElement = cachedEditableTarget is null ? null : element;
-                        cachedEditableScreen = cachedEditableTarget is null ? null : targetScreen;
-                    }
-                }
-                if (target is not null && !IsOwnWindow(target) && !IsIgnored(target) && !IsIgnoredForeground())
-                {
-                    var modifiers = CurrentModifiers();
                     var key = ((Keys)keyCode).ToString();
                     var character = TextCharacter(info, modifiers);
                     var submittingEdit = keyCode == (int)Keys.Enter &&
                         IsEditableTarget(target, cachedEditableElement);
-                    if (submittingEdit)
+                    if (submittingEdit && foreground == GetForegroundWindow() &&
+                        focus == ForegroundFocusHandle() && DateTimeOffset.Now - at < TimeSpan.FromSeconds(2))
                     {
                         try
                         {
@@ -708,9 +1393,29 @@ internal sealed class Recorder : IDisposable
                         }
                         catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or
                             System.Runtime.InteropServices.COMException) { System.Diagnostics.Trace.WriteLine(ex); }
-                    Add(new(DateTimeOffset.Now, "key", target, character,
+                    string? selectionState = null;
+                    if (target.Process == "EXCEL" && keyCode == (int)Keys.C &&
+                        modifiers == "Control")
+                    {
+                        try
+                        {
+                            if (foreground != GetForegroundWindow() ||
+                                DateTimeOffset.Now - at > TimeSpan.FromSeconds(2))
+                                throw new InvalidOperationException("Excel copy selection changed before capture.");
+                            selectionState = "excel-selection-range:" + ExcelNativeSheet.Read<string>(foreground,
+                                sheet => ExcelNativeSheet.SelectionAddress(sheet));
+                        }
+                        catch (Exception ex) when (ex is InvalidOperationException or COMException)
+                        {
+                            Add(new(at, "unresolved-input", target, null, "Control+C", null, null, null,
+                                Diagnostic: "Excel copy range could not be captured: " + ex.Message));
+                            return;
+                        }
+                    }
+                    Add(new(at, "key", target, character,
                         modifiers == "None" ? key : $"{modifiers}+{key}", null,
-                        string.IsNullOrWhiteSpace(submittedValue) ? null : "field-value:" + submittedValue, null));
+                        string.IsNullOrWhiteSpace(submittedValue) ? null : "field-value:" + submittedValue,
+                        selectionState));
                     if (searchEnter)
                         QueueSearchLaunchOutcome(events.Count - 1, foreground);
                     if (submittingEdit)
@@ -729,7 +1434,6 @@ internal sealed class Recorder : IDisposable
             }
             catch (Exception ex) { System.Diagnostics.Trace.WriteLine(ex); }
         }
-        return CallNextHookEx(0, code, message, data);
     }
 
     private static bool IsOwnWindow(ControlRef target) =>
@@ -758,6 +1462,10 @@ internal sealed class Recorder : IDisposable
         return false;
     }
 
+    // Called after the low-level keyboard hook has returned. UI Automation, COM,
+    // screenshot capture, and WinForms timer work must not run on the hook stack.
+    public void PrepareIntentDialog() => FinishTypingCapture();
+
     public void IntentDialogOpened(nint window) => intentDialogWindow = window;
     public void IntentDialogClosed()
     {
@@ -766,8 +1474,69 @@ internal sealed class Recorder : IDisposable
         cachedEditableTarget = null;
     }
 
+    public int Pause(int? discardFromEvent = null)
+    {
+        if (!IsRecording || capturePausedByUser) return 0;
+        FinishTypingCapture();
+        FinishPendingClick();
+        CompleteScroll();
+        var discarded = 0;
+        if (discardFromEvent is int start)
+        {
+            lock (events)
+            {
+                if (start >= 0 && start < events.Count)
+                {
+                    discarded = events.Count - start;
+                    events.RemoveRange(start, discarded);
+                }
+            }
+        }
+        capturePausedByUser = true;
+        chartSamplePaused = true;
+        Interlocked.Increment(ref chartInputGeneration);
+        hoveredChart = null;
+        cachedEditableTarget = null;
+        cachedEditableElement = null;
+        cachedKeyboardTarget = null;
+        cachedKeyboardScreen = null;
+        return discarded;
+    }
+
+    public void Resume()
+    {
+        if (!IsRecording || !capturePausedByUser) return;
+        capturePausedByUser = false;
+        chartSamplePaused = capturePausedForIntent || pendingLegendOutcome is not null;
+        chartPointerDown = false;
+        chartSampleRequested.Set();
+        cachedEditableTarget = null;
+        cachedEditableElement = null;
+        cachedKeyboardTarget = null;
+        cachedKeyboardScreen = null;
+        cachedKeyboardFocus = 0;
+        cachedKeyboardWindow = 0;
+    }
+
 
     private void FinishPendingClick()
+    {
+        var index = pendingClickIndex;
+        try { FinishPendingClickCore(); }
+        catch (ArgumentException ex)
+        {
+            System.Diagnostics.Trace.WriteLine("Click outcome accessibility capture: " + ex);
+            if (index < 0 || index >= events.Count) return;
+            RecordedEvent unresolved;
+            lock (events)
+                events[index] = unresolved = events[index] with { Kind = "unresolved-input",
+                    Diagnostic = "The accessibility provider returned invalid bounds while verifying the click: " +
+                        ex.Message + " Its outcome was not guessed." };
+            Captured?.Invoke(unresolved);
+        }
+    }
+
+    private void FinishPendingClickCore()
     {
         clickCapture.Stop();
         if (pendingClickIndex < 0 || pendingClickIndex >= events.Count) return;
@@ -780,8 +1549,7 @@ internal sealed class Recorder : IDisposable
         pendingClickIndex = -1; pendingClickScreen = null; pendingClickPoint = null;
         pendingClickWindow = 0; pendingClickTabBefore = null;
         pendingClickFocusBefore = null;
-        var screenshot = events[index].Target?.Window == "Find and Replace" &&
-            events[index].Target?.ControlType != "ControlType.Window" ? null : Capture(screen);
+        string? screenshot;
         ControlRef? changedTab = null;
         if (window != 0 && tabBefore is not null)
         {
@@ -802,7 +1570,57 @@ internal sealed class Recorder : IDisposable
             QueueDialogControlSnapshot(window);
         }
         var afterState = events[index].AfterState;
-        if (changedTab is null && point is { } clickPoint && target is not null &&
+        if (ExcelFilterPlan.IsItem(target))
+        {
+            try
+            {
+                afterState = ExcelFilterPlan.CaptureState(target!);
+            }
+            catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or
+                System.Runtime.InteropServices.COMException) { System.Diagnostics.Trace.WriteLine(ex); }
+        }
+        screenshot = events[index].Target?.Window == "Find and Replace" &&
+            events[index].Target?.ControlType != "ControlType.Window" ? null : Capture(screen);
+
+        // A result dialog can hide the command that opened it. After its
+        // acknowledgement closes, focus commonly returns to that exact command.
+        // Use that live accessibility identity to repair the preceding weak
+        // dialog click and mark this click as the result acknowledgement.
+        if (target?.ControlType is "ControlType.Window" or "ControlType.Pane" or
+                "ControlType.Custom" or "ControlType.Tab")
+        {
+            try
+            {
+                var focusedElement = AutomationElement.FocusedElement;
+                var returnedCommand = Automation.Describe(focusedElement);
+                if (returnedCommand is { ControlType: "ControlType.Button" or "ControlType.MenuItem" or
+                        "ControlType.TabItem" or "ControlType.CheckBox" or "ControlType.RadioButton",
+                        Name.Length: > 0 } &&
+                    returnedCommand.Process == target.Process && returnedCommand.Window == target.Window)
+                {
+                    lock (events)
+                    {
+                        var priorIndex = events.FindLastIndex(index - 1, prior =>
+                            prior.Kind == "click" && prior.Target is { } priorTarget &&
+                            priorTarget.Process == target.Process && priorTarget.Window == target.Window &&
+                            priorTarget.ControlType is "ControlType.Window" or "ControlType.Pane" or
+                                "ControlType.Custom" or "ControlType.Tab" &&
+                            events[index].At - prior.At < TimeSpan.FromSeconds(15));
+                        if (priorIndex >= 0)
+                        {
+                            events[priorIndex] = events[priorIndex] with
+                            { Target = returnedCommand, AfterState = "dialog-command-result" };
+                            TargetCorrected?.Invoke(returnedCommand);
+                            afterState = "dialog-result-acknowledgement";
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or
+                System.Runtime.InteropServices.COMException) { System.Diagnostics.Trace.WriteLine(ex); }
+        }
+        if (changedTab is null && events[index].Diagnostic != "Control identity verified at mouse-down." &&
+            point is { } clickPoint && target is not null &&
             target.ClassName != "XLGridRowHeader" &&
             (target.ControlType == "ControlType.DataItem" || target.ControlType == "ControlType.ToolTip") &&
             events[index].Kind is "click" or "context-click")
@@ -837,7 +1655,8 @@ internal sealed class Recorder : IDisposable
                 System.Diagnostics.Trace.WriteLine(ex);
             }
         }
-        if (changedTab is null && point is { } selectedPoint && target?.ControlType is
+        if (changedTab is null && events[index].Diagnostic != "Control identity verified at mouse-down." &&
+            point is { } selectedPoint && target?.ControlType is
             "ControlType.DataItem" or "ControlType.ListItem")
         {
             target = CorrectCompactListWindow(target, selectedPoint.X, selectedPoint.Y);
@@ -880,6 +1699,29 @@ internal sealed class Recorder : IDisposable
             events[index] = current with
             { Screenshot = screenshot, Target = target, AfterState = afterState };
         }
+        if (index > 0)
+        {
+            RecordedEvent? unresolved = null;
+            lock (events)
+            {
+                var prior = events[index - 1];
+                if (IsUnresolvedDialogEvent(prior) &&
+                    prior.Target is { Process: "EXCEL", Window: { Length: > 0 } priorWindow } &&
+                    target is { Process: "EXCEL", ControlType: "ControlType.TabItem",
+                        Window: { Length: > 0 } tabWindow, Name: { Length: > 0 } } &&
+                    string.Equals(priorWindow, tabWindow, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Excel can expose the workbook surface itself while focus moves between
+                    // sheet tabs. The following verified tab proves that this weak click had
+                    // no independent command outcome, so retain it only as discardable focus
+                    // evidence and do not interrupt a valid recording.
+                    events[index - 1] = prior with { AfterState = "worksheet-tab-focus-only" };
+                }
+                else if (IsUnresolvedDialogEvent(prior)) unresolved = prior;
+            }
+            if (unresolved is not null)
+                QueueUnresolvedDialogNotice(index - 1, unresolved);
+        }
         if (afterState != "unverified-click" && target?.ControlType == "ControlType.DataItem" &&
             !string.IsNullOrWhiteSpace(target.AutomationId) && IsFilteredGridContext(index))
         {
@@ -918,6 +1760,25 @@ internal sealed class Recorder : IDisposable
         if (target is not null && (IsEditableTarget(target) ||
             target.ControlType == "ControlType.Pane" && !string.IsNullOrEmpty(target.AutomationId)))
             CaptureCompletedField(index, target, null);
+    }
+
+    private void QueueUnresolvedDialogNotice(int index, RecordedEvent recorded)
+    {
+        pendingWindowCaptures.Add(Task.Run(async () =>
+        {
+            // Command retries and the diagnostic probe may still be identifying
+            // an owner-drawn control after the next click has been processed.
+            await Task.Delay(5000);
+            hookDispatcher.BeginInvoke(new Action(() =>
+            {
+                lock (events)
+                    if (index >= events.Count || events[index].At != recorded.At ||
+                        !IsUnresolvedDialogEvent(events[index])) return;
+                if (!IsRecording || IsPaused) return;
+                UnresolvedDialogClick?.Invoke(index,
+                    recorded.Target?.Window ?? recorded.Target?.Name ?? "dialog");
+            }));
+        }));
     }
 
     private static bool IsWeakClickTarget(ControlRef target) =>
@@ -1013,7 +1874,15 @@ internal sealed class Recorder : IDisposable
         {
             // Popup menus can be untitled windows owned by the workbook.
             // Keep the recorded control tied to its application's window.
-            foreach (var candidate in new[] { GetAncestor(root, 3), GetForegroundWindow() })
+            var owners = new List<nint> { GetAncestor(root, 3) };
+            for (var owner = GetWindow(root, 4); owner != 0 && owners.Count < 16;
+                owner = GetWindow(owner, 4))
+            {
+                if (owners.Contains(owner)) break;
+                owners.Add(owner);
+            }
+            owners.Add(GetForegroundWindow());
+            foreach (var candidate in owners)
             {
                 if (candidate == 0) continue;
                 GetWindowThreadProcessId(candidate, out var candidateProcess);
@@ -1025,8 +1894,594 @@ internal sealed class Recorder : IDisposable
         if (title.Length == 0) return null;
         string process;
         try { process = System.Diagnostics.Process.GetProcessById((int)processId).ProcessName; }
-        catch { return null; }
-        return new ControlRef(process, title.ToString(), id, name, type, className, null);
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+        { System.Diagnostics.Trace.WriteLine(ex); return null; }
+        return new ControlRef(process, title.ToString(), id, name, type, className, null,
+            ProcessId: (int)processId);
+    }
+
+    private static ControlRef? CapturePopupMenuTarget(int x, int y) =>
+        CapturePopupMenuSnapshot(x, y)?.Target;
+
+    private static MouseDownSnapshot? CapturePopupMenuSnapshot(int x, int y)
+    {
+        var pointer = WindowFromPoint(new System.Drawing.Point(x, y));
+        var popup = pointer == 0 ? 0 : GetAncestor(pointer, 2);
+        if (popup == 0 || !IsWindowVisible(popup)) return null;
+        var className = new System.Text.StringBuilder(128);
+        GetClassName(popup, className, className.Capacity);
+        // Limit synchronous UIA access to a small, transient native popup, not
+        // a potentially large application tree.
+        if (className.ToString() != "#32768" &&
+            ((GetWindowLong(popup, -16) & unchecked((int)0x80000000)) == 0 ||
+             GetWindow(popup, 4) == 0)) return null;
+        try
+        {
+            var element = AutomationElement.FromPoint(new System.Windows.Point(x, y));
+            for (var depth = 0; element is not null && depth < 4; depth++)
+            {
+                if (element.Current.ControlType == ControlType.MenuItem &&
+                    element.Current.IsEnabled && !element.Current.IsOffscreen)
+                {
+                    var bounds = element.Current.BoundingRectangle;
+                    if (bounds.IsEmpty || !bounds.Contains(x, y)) return null;
+                    var described = Automation.Describe(element);
+                    if (described is null || string.IsNullOrWhiteSpace(described.Name)) return null;
+                    var owner = NativeControlRef(popup, described.AutomationId,
+                        described.Name, described.ControlType!, described.ClassName);
+                    if (owner is null || owner.Process != described.Process ||
+                        owner.ProcessId != described.ProcessId) return null;
+                    return new(null, owner with { ParentName = Automation.RecordedMenuParentName(element) })
+                    { WindowHandle = popup, InputBounds = bounds };
+                }
+                element = TreeWalker.ControlViewWalker.GetParent(element);
+            }
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or
+            System.Runtime.InteropServices.COMException) { System.Diagnostics.Trace.WriteLine(ex); }
+        return null;
+    }
+
+    private void CompleteChartSourceCapture()
+    {
+        if (chartSourceCapture is not { } pending) return;
+        if (mouseHook != 0 && Environment.TickCount64 - Interlocked.Read(ref lastChartInputTick) < 1500)
+            return;
+        var contextIndex = events.FindLastIndex(item => item.Kind == "context-click" &&
+            item.Target == pending.Target);
+        if (contextIndex < 0) return;
+        var sequence = events.Skip(contextIndex + 1).ToList();
+        if (sequence.Any(item => item.Target is { } target &&
+            (target.Process != pending.Target.Process || target.ProcessId != pending.Target.ProcessId ||
+                target.Window != pending.Target.Window && target.Window != "Select Data Source")))
+        {
+            chartSourceCapture = null;
+            return;
+        }
+        if (sequence.Any(item => item.Target is { Window: "Select Data Source", Name: "Cancel" }))
+        {
+            chartSourceCapture = null;
+            return;
+        }
+        if (!sequence.Any(item => item.Target?.Window == "Select Data Source")) return;
+        var foreground = GetForegroundWindow();
+        if (foreground != pending.Window || !IsWindowEnabled(pending.Window)) return;
+        try
+        {
+            if (pending.Sheet is null)
+                throw new InvalidOperationException("The chart worksheet identity was not captured.");
+            var after = ExcelNativeSheet.Read<ExcelNativeSheet.ChartSource>(pending.Window,
+                sheet => ExcelNativeSheet.ReadChartSourceFromSheet(sheet, pending.Sheet, pending.Target.Name!));
+            if (after != pending.Before)
+            {
+                Add(new(DateTimeOffset.Now, "set-chart-source-range", pending.Target,
+                    System.Text.Json.JsonSerializer.Serialize(after), null, Capture(Screen.FromHandle(pending.Window)),
+                    System.Text.Json.JsonSerializer.Serialize(pending.Before), "chart-source-verified",
+                    Diagnostic: "Captured the chart's actual category/value source after Select Data confirmation."));
+                chartSourceCapture = null;
+            }
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or COMException or NotSupportedException)
+        {
+            // Range selection can temporarily expose a partial/unsupported source
+            // while Excel's collapsed selector is still open. Keep observing until
+            // recording stops; only then is the absence of a valid outcome final.
+            if (IsRecording) return;
+            chartSourceCapture = null;
+            Add(new(DateTimeOffset.Now, "unresolved-input", pending.Target, null, null, null, null, null,
+                Diagnostic: "The confirmed chart source could not be captured: " + ex.Message +
+                    " Re-record this chart edit with a supported adjacent category/value range."));
+        }
+    }
+
+    private void PrimeHoveredChart() =>
+        PrimeHoveredChartCore(point => AutomationElement.FromPoint(point));
+
+    private void PrimeHoveredChartCore(Func<System.Windows.Point, AutomationElement?> hitTest)
+    {
+        if (chartSampleStopping || chartSamplePaused || chartPointerDown || chartSourceCapture is not null) return;
+        var inputGeneration = Interlocked.Read(ref chartInputGeneration);
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var stage = "pointer UIA hit";
+        var attemptedChart = false;
+        var previous = hoveredChart;
+        try
+        {
+            var point = Cursor.Position;
+            var root = GetAncestor(WindowFromPoint(point), 2);
+            var element = hitTest(new(point.X, point.Y));
+            if (element is null)
+            {
+                CaptureDiagnostic("chart hover: pointer UIA hit returned no element; no snapshot published");
+                return;
+            }
+            var tooltip = element.Current.ControlType == ControlType.ToolTip;
+            if (tooltip && root != GetForegroundWindow())
+            {
+                GetWindowThreadProcessId(root, out var tooltipOwner);
+                GetWindowThreadProcessId(GetForegroundWindow(), out var foregroundOwner);
+                if (tooltipOwner != foregroundOwner) return;
+                root = GetForegroundWindow();
+            }
+            if (root == 0 || root != GetForegroundWindow() || !IsWindowEnabled(root) ||
+                NativeControlRef(root, "", "", "ControlType.Image", "") is not { Process: "EXCEL" } target)
+                return;
+            var names = new List<string>();
+            var bounds = ReadChartBounds(() => element.Current.BoundingRectangle);
+            var ancestor = element;
+            var chartAncestor = false;
+            for (var depth = 0; ancestor is not null && depth < 10; depth++)
+            {
+                if (ancestor.Current.ControlType == ControlType.Image)
+                {
+                    chartAncestor = true;
+                    if (!string.IsNullOrWhiteSpace(ancestor.Current.Name)) names.Add(ancestor.Current.Name);
+                    var rectangle = ReadChartBounds(() => ancestor.Current.BoundingRectangle);
+                    if (!rectangle.IsEmpty && rectangle.Contains(point.X, point.Y) &&
+                        (bounds.IsEmpty || rectangle.Width * rectangle.Height > bounds.Width * bounds.Height))
+                        bounds = rectangle;
+                }
+                ancestor = TreeWalker.RawViewWalker.GetParent(ancestor);
+            }
+            if (!chartAncestor && !tooltip) return;
+            attemptedChart = true;
+            stage = "native chart identity and legend";
+            var chart = ExcelNativeSheet.Read<ExcelNativeSheet.ChartCapture?>(root,
+                sheet => ExcelNativeSheet.CaptureChartAtPoint(sheet, point.X, point.Y, true, names));
+            if (chart is null) { CaptureDiagnostic("chart hover: native identity did not match"); return; }
+            if (tooltip || bounds.IsEmpty)
+            {
+                if (previous?.Snapshot is not { } captured || captured.WindowHandle != root ||
+                    captured.Target.Name != chart.Name || captured.ChartSheet != chart.Sheet ||
+                    captured.Element is null) { CaptureDiagnostic("chart hover: tooltip/invalid bounds has no corroborated prior element"); return; }
+                element = captured.Element;
+                bounds = ReadChartBounds(() => element.Current.BoundingRectangle);
+            }
+            if (bounds.IsEmpty || !bounds.Contains(point.X, point.Y))
+            { CaptureDiagnostic("chart hover: bounds unavailable or do not contain pointer"); return; }
+            var livePoint = Cursor.Position;
+            if (chartSampleStopping || chartSamplePaused || capturePausedByUser || capturePausedForIntent ||
+                inputGeneration != Interlocked.Read(ref chartInputGeneration) ||
+                chartPointerDown || !bounds.Contains(livePoint.X, livePoint.Y) ||
+                WindowFromPoint(livePoint) != WindowFromPoint(point) ||
+                GetForegroundWindow() != root)
+            { CaptureDiagnostic("chart hover: input, pointer or foreground changed during sampling"); return; }
+            hoveredChart = new(DateTimeOffset.Now, bounds, new(element, target with {
+                Name = chart.Name, ClassName = "ExcelChartObject" }) {
+                WindowHandle = root, HitWindow = WindowFromPoint(point), ChartSheet = chart.Sheet,
+                LegendBefore = chart.Legend });
+            CaptureDiagnostic($"chart hover: snapshot ready; legend={chart.Legend is not null}; {watch.ElapsedMilliseconds} ms");
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or ArgumentException or
+            InvalidOperationException or COMException or System.ComponentModel.Win32Exception)
+        {
+            // A non-elevated recorder cannot inspect an elevated window. Chart hover sampling is
+            // advisory, so access denial must discard this sample instead of terminating RSR.
+            CaptureDiagnostic($"chart hover failed at {stage}: {ex.GetType().Name}; {watch.ElapsedMilliseconds} ms");
+            System.Diagnostics.Trace.WriteLine("Chart hover capture could not sample a valid accessibility rectangle: " + ex.Message);
+        }
+        finally
+        {
+            if (watch.ElapsedMilliseconds >= 100 && (attemptedChart || watch.ElapsedMilliseconds >= 500))
+                CaptureDiagnostic($"chart hover stage {stage}: {watch.ElapsedMilliseconds} ms");
+        }
+    }
+
+    private void StartChartSampling(Action sample)
+    {
+        if (chartSampleThread is not null)
+            throw new InvalidOperationException("The previous chart sampler has not stopped.");
+        chartSampleStopping = false;
+        chartSamplePaused = false;
+        chartSampleThread = new Thread(() =>
+        {
+            while (!chartSampleStopping)
+            {
+                chartSampleRequested.WaitOne();
+                if (chartSampleStopping) continue;
+                try { sample(); }
+                catch (Exception ex)
+                {
+                    // This worker only improves chart recognition. Keep recorder input hooks alive
+                    // when any inaccessible or short-lived application defeats a sampling provider.
+                    CaptureDiagnostic($"chart sampler ignored {ex.GetType().Name}: {ex.Message}");
+                    System.Diagnostics.Trace.WriteLine("Chart sampling failed without stopping recording: " + ex);
+                }
+            }
+        }) { IsBackground = true, Name = "RSR accessibility chart sampler" };
+        chartSampleThread.SetApartmentState(ApartmentState.STA);
+        chartSampleThread.Start();
+        chartSampleRequested.Set();
+    }
+
+    private void StopChartSampling()
+    {
+        chartSampleStopping = true;
+        chartSampleRequested.Set();
+        if (chartSampleThread is null) return;
+        if (!chartSampleThread.Join(TimeSpan.FromSeconds(10)))
+            throw new TimeoutException("The accessibility chart sampler did not stop within ten seconds.");
+        chartSampleThread = null;
+        hoveredChart = null;
+    }
+
+    private void FinishLegendOutcome()
+    {
+        legendOutcomeCapture.Stop();
+        var outcome = pendingLegendOutcome;
+        pendingLegendOutcome = null;
+        outcome?.Invoke();
+    }
+
+    internal static System.Windows.Rect ReadChartBounds(Func<System.Windows.Rect> read)
+    {
+        try
+        {
+            var rectangle = read();
+            if (!rectangle.IsEmpty && double.IsFinite(rectangle.X) && double.IsFinite(rectangle.Y) &&
+                double.IsFinite(rectangle.Width) && double.IsFinite(rectangle.Height) &&
+                rectangle.Width > 0 && rectangle.Height > 0)
+                return rectangle;
+            System.Diagnostics.Trace.WriteLine("Chart accessibility bounds are empty or invalid; no pointer identity was inferred.");
+        }
+        catch (ArgumentException ex)
+        {
+            System.Diagnostics.Trace.WriteLine("Chart accessibility provider returned invalid bounds: " + ex.Message);
+        }
+        return System.Windows.Rect.Empty;
+    }
+
+    private sealed record MouseDownSnapshot(AutomationElement? Element, ControlRef Target)
+    {
+        public System.Windows.Rect InputBounds { get; init; } = System.Windows.Rect.Empty;
+        public nint WindowHandle { get; init; }
+        public nint HitWindow { get; init; }
+        public bool IsDialog { get; init; }
+        public string? ChartSheet { get; init; }
+        public ExcelNativeSheet.LegendLayout? LegendBefore { get; init; }
+        public ExcelNativeSheet.ChartSource? ChartSource { get; init; }
+    }
+
+    private static MouseDownSnapshot? CaptureFilterItemAtPoint(int x, int y)
+    {
+        var pointer = WindowFromPoint(new System.Drawing.Point(x, y));
+        var root = pointer == 0 ? 0 : GetAncestor(pointer, 2);
+        if (root == 0 || GetWindow(root, 4) == 0 ||
+            (GetWindowLong(root, -16) & 0x00C00000) != 0 ||
+            (GetWindowLong(root, -16) & unchecked((int)0x80000000)) == 0 ||
+            !IsCompactAtPoint(root, x, y, Screen.FromPoint(new(x, y)).Bounds) ||
+            !string.Equals(DescribeNativeWindowOwner(root), "EXCEL", StringComparison.OrdinalIgnoreCase) ||
+            MsaaActions.FilterItemNameAtPoint(x, y) is not { } name) return null;
+        var target = NativeControlRef(root, "", name, "ControlType.TreeItem", "");
+        return target is null ? null : new(null, target with { ParentName = "Manual Filter" })
+        { WindowHandle = root };
+    }
+
+    private static MouseDownSnapshot? CaptureDirectMenuAtPoint(int x, int y) =>
+        CaptureDirectMenuAtPointCore(x, y, true);
+
+    // The released-menu loop refreshes continuously while the popup stays open; a
+    // slow UIA read (search-box menus take ~0.5 s) must not age out the newest snapshot.
+    internal static readonly TimeSpan PointerMenuLifetime = TimeSpan.FromMilliseconds(1500);
+
+    private static bool IsPointerMenuFresh(PointerMenu menu, DateTimeOffset at, long generation,
+        nint foreground, int x, int y) =>
+        menu.Generation == generation && IsMenuScopeForeground(menu.Foreground, foreground) &&
+        at >= menu.At && at - menu.At < PointerMenuLifetime &&
+        menu.Snapshot.InputBounds.Contains(x, y);
+
+    // Context menus with an embedded search box take keyboard focus. Treat that
+    // same-process popup as part of the original menu scope, never another window.
+    private static bool IsMenuScopeForeground(nint original, nint current)
+    {
+        if (current == original) return current != 0;
+        if (current == 0 || original == 0 || !IsWindowVisible(current)) return false;
+        GetWindowThreadProcessId(current, out var currentProcess);
+        GetWindowThreadProcessId(original, out var originalProcess);
+        if (currentProcess == 0 || currentProcess != originalProcess) return false;
+        var root = GetAncestor(current, 2);
+        if (root == 0 || root == GetAncestor(original, 2)) return false;
+        if (GetAncestor(root, 3) == GetAncestor(original, 3)) return true;
+        var style = unchecked((uint)GetWindowLong(root, -16));
+        return (style & 0x80000000) != 0 && (style & 0x00C00000) == 0;
+    }
+
+    private async Task CaptureReleasedContextMenuAsync(nint foreground, long generation)
+    {
+        try
+        {
+            await Task.Run(async () =>
+            {
+                var attempt = 0;
+                for (; attempt < 40 && IsRecording && !capturePausedByUser &&
+                    !capturePausedForIntent && generation == Interlocked.Read(ref chartInputGeneration) &&
+                    IsMenuScopeForeground(foreground, GetForegroundWindow()); attempt++)
+                {
+                    var started = DateTimeOffset.Now;
+                    GetWindowThreadProcessId(foreground, out var processId);
+                    var popups = new List<nint>();
+                    EnumWindows((popup, _) =>
+                    {
+                        GetWindowThreadProcessId(popup, out var owner);
+                        if (owner != processId || !IsWindowVisible(popup) ||
+                            !GetWindowRect(popup, out var rect)) return true;
+                        var className = new System.Text.StringBuilder(128);
+                        GetClassName(popup, className, className.Capacity);
+                        var center = new System.Drawing.Point((rect.Left + rect.Right) / 2,
+                            (rect.Top + rect.Bottom) / 2);
+                        if (className.ToString() == "#32768" ||
+                            GetWindow(popup, 4) != 0 && (GetWindowLong(popup, -16) & 0x00C00000) == 0 &&
+                            IsCompactAtPoint(popup, center.X, center.Y, Screen.FromPoint(center).Bounds))
+                            popups.Add(popup);
+                        return popups.Count < 8;
+                    }, 0);
+                    var captured = new List<PointerMenu>();
+                    foreach (var popup in popups)
+                    {
+                        var items = AutomationElement.FromHandle(popup).FindAll(TreeScope.Descendants,
+                            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem));
+                        if (items.Count > 128) continue;
+                        foreach (AutomationElement item in items)
+                        {
+                            var state = item.Current;
+                            var bounds = state.BoundingRectangle;
+                            if (state.ProcessId != processId || !state.IsEnabled || state.IsOffscreen ||
+                                string.IsNullOrWhiteSpace(state.Name) || bounds.IsEmpty ||
+                                bounds.Width <= 0 || bounds.Height <= 0) continue;
+                            var center = new System.Drawing.Point((int)(bounds.Left + bounds.Width / 2),
+                                (int)(bounds.Top + bounds.Height / 2));
+                            if (GetAncestor(WindowFromPoint(center), 2) != popup) continue;
+                            var target = NativeControlRef(popup, state.AutomationId, state.Name,
+                                "ControlType.MenuItem", state.ClassName);
+                            if (target is null) continue;
+                            captured.Add(new(started, generation, foreground,
+                                new(null, target with { ParentName = Automation.RecordedMenuParentName(item) })
+                                { WindowHandle = popup, InputBounds = bounds }));
+                        }
+                    }
+                    if (generation != Interlocked.Read(ref chartInputGeneration) ||
+                        !IsRecording || capturePausedByUser || capturePausedForIntent ||
+                        !IsMenuScopeForeground(foreground, GetForegroundWindow())) break;
+                    var completed = DateTimeOffset.Now;
+                    if (completed - started < PointerMenuLifetime)
+                        pointerMenus = captured.Select(item => item with { At = completed }).ToArray();
+                    if (captured.Count > 0)
+                        CaptureDiagnostic($"released menu snapshot: {captured.Count} items; {(DateTimeOffset.Now - started).TotalMilliseconds:F0} ms");
+                    await Task.Delay(150);
+                }
+                if (attempt < 40 && IsRecording)
+                    CaptureDiagnostic($"released menu capture stopped after {attempt} attempt(s): " +
+                        (generation != Interlocked.Read(ref chartInputGeneration) ? "new input" :
+                        capturePausedByUser || capturePausedForIntent ? "paused" :
+                        "foreground left menu scope: " + DescribeNativeWindow(GetForegroundWindow())));
+            }).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is ArgumentException or ElementNotAvailableException or
+            InvalidOperationException or COMException)
+        { CaptureDiagnostic("released menu capture rejected: " + ex.GetType().Name + ": " + ex.Message); }
+    }
+
+    private static MouseDownSnapshot? CaptureDirectMenuAtPointCore(int x, int y, bool useMsaa)
+    {
+        var pointer = WindowFromPoint(new System.Drawing.Point(x, y));
+        if (pointer == 0) return null;
+        var root = GetAncestor(pointer, 2);
+        if (root == 0 || !IsWindowVisible(root)) return null;
+        var className = new System.Text.StringBuilder(128);
+        GetClassName(root, className, className.Capacity);
+        if (CurrentMenuOwner() == 0 && className.ToString() != "#32768" &&
+            (GetWindow(root, 4) == 0 ||
+                !IsCompactAtPoint(root, x, y, Screen.FromPoint(new(x, y)).Bounds)))
+            return null;
+        var command = useMsaa ? MsaaCommandAtPoint(x, y) : null;
+        if (command is not { Type: "ControlType.MenuItem" } item)
+        {
+            return CapturePopupMenuSnapshot(x, y);
+        }
+        var target = NativeControlRef(root, null, item.Name, item.Type, null);
+        if (target is null) return null;
+        return new(null, target with { ParentName = MsaaActions.MenuParentAtPoint(x, y) })
+        { WindowHandle = root, InputBounds = new(item.X, item.Y, item.Width, item.Height) };
+    }
+
+    private static MouseDownSnapshot? CaptureOwnedPopupCommandAtPoint(int x, int y)
+    {
+        var hit = WindowFromPoint(new System.Drawing.Point(x, y));
+        var popup = hit == 0 ? 0 : GetAncestor(hit, 2);
+        if (popup == 0 || !IsWindowVisible(popup) ||
+            GetWindow(popup, 4) == 0 ||
+            !IsCompactAtPoint(popup, x, y, Screen.FromPoint(new(x, y)).Bounds))
+            return null;
+        GetWindowThreadProcessId(popup, out var processId);
+        GetWindowThreadProcessId(GetWindow(popup, 4), out var ownerId);
+        if (processId == 0 || processId != ownerId) return null;
+        var command = MsaaCommandAtPoint(x, y);
+        if (command is not { Type: "ControlType.Button" or "ControlType.CheckBox" or
+                "ControlType.RadioButton" } action)
+            return null;
+        var target = NativeControlRef(popup, null, action.Name, action.Type, null);
+        return target is null ? null : new(null, target) { WindowHandle = popup, IsDialog = true };
+    }
+
+    private static MouseDownSnapshot? CaptureNativeDialogCommandAtPoint(int x, int y)
+    {
+        var pointer = WindowFromPoint(new System.Drawing.Point(x, y));
+        var screen = Screen.FromPoint(new System.Drawing.Point(x, y)).Bounds;
+        var window = pointer;
+        var direct = false;
+        (string Name, string Type, int X, int Y, int Width, int Height)? command = null;
+        for (var depth = 0; window != 0 && depth < 12;
+            window = GetAncestor(window, 1), depth++)
+        {
+            if (!IsCompactAtPoint(window, x, y, screen)) continue;
+            if (!IsNativeDialogSurface(window)) continue;
+            var caption = new System.Text.StringBuilder(512);
+            GetWindowText(window, caption, caption.Capacity);
+            if (caption.Length == 0) continue;
+            var className = new System.Text.StringBuilder(128);
+            GetClassName(window, className, className.Capacity);
+            if (className.ToString().Equals("Button", StringComparison.OrdinalIgnoreCase) ||
+                IsNativeEditClass(className.ToString()) ||
+                className.ToString().Contains("Tab", StringComparison.OrdinalIgnoreCase)) continue;
+            if (!direct)
+            {
+                command = MsaaCommandAtPoint(x, y);
+                direct = true;
+            }
+            if (command is not { Type: "ControlType.Button" or "ControlType.RadioButton" } action)
+                continue;
+            var target = NativeControlRef(window, null, action.Name, action.Type, null);
+            if (target is null || target.Window == action.Name) continue;
+            return new(null, target) { WindowHandle = window, IsDialog = true };
+        }
+        return null;
+    }
+
+    private static MouseDownSnapshot? CaptureMouseDownTarget(int x, int y)
+    {
+        var pointer = WindowFromPoint(new System.Drawing.Point(x, y));
+        var root = pointer == 0 ? 0 : GetAncestor(pointer, 2);
+        if (root == 0) return null;
+        try
+        {
+            var element = AutomationElement.FromPoint(new System.Windows.Point(x, y));
+            var dialog = element.Current.ControlType == ControlType.TabItem ? null : WindowAncestor(element);
+            if (dialog is not null && dialog.Current.NativeWindowHandle != 0 &&
+                dialog.Current.ProcessId == element.Current.ProcessId &&
+                dialog.Current.BoundingRectangle.Contains(x, y))
+                root = (nint)dialog.Current.NativeWindowHandle;
+            return CreateMouseDownSnapshot(element, root, x, y);
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or ArgumentException or InvalidOperationException or
+            System.Runtime.InteropServices.COMException)
+        { System.Diagnostics.Trace.WriteLine(ex); return null; }
+    }
+
+    private static MouseDownSnapshot? CreateMouseDownSnapshot(AutomationElement element, nint root, int x, int y)
+    {
+        try
+        {
+            var pointer = WindowFromPoint(new System.Drawing.Point(x, y));
+            MouseDownSnapshot Snapshot(AutomationElement captured, ControlRef target)
+            {
+                var tab = captured.Current.ControlType == ControlType.TabItem;
+                var dialog = tab ? null : WindowAncestor(captured);
+                var screen = Screen.FromPoint(new System.Drawing.Point(x, y)).Bounds;
+                var isDialog = false;
+                var handle = root;
+                if (tab)
+                    isDialog = IsCompactAtPoint(root, x, y, screen) && IsNativeDialogSurface(root);
+                if (dialog is not null)
+                {
+                    var state = dialog.Current;
+                    isDialog = state.ProcessId == captured.Current.ProcessId &&
+                        !string.IsNullOrWhiteSpace(state.Name) &&
+                        state.BoundingRectangle.Contains(x, y) &&
+                        state.BoundingRectangle.Width * state.BoundingRectangle.Height <
+                            (long)screen.Width * screen.Height * 8 / 10;
+                    if (isDialog)
+                    {
+                        target = target with { Window = state.Name };
+                        if (state.NativeWindowHandle != 0) handle = (nint)state.NativeWindowHandle;
+                    }
+                }
+                return new(captured, target)
+                {
+                    WindowHandle = handle,
+                    IsDialog = isDialog
+                };
+            }
+            if (NativeCloseAtPoint(root, x, y))
+            {
+                var close = NativeControlRef(root, null, "Close", "ControlType.Button", null);
+                if (close is not null) return Snapshot(element, close);
+            }
+            var type = element.Current.ControlType;
+            if (type == ControlType.Window || type == ControlType.Pane ||
+                type == ControlType.Custom || type == ControlType.Tab || type == ControlType.Text ||
+                type == ControlType.Group)
+            {
+                // A window-level hit is not a verified command. Resolve native
+                // children while the clicked dialog still exists, not after delivery.
+                var button = FindNativeActionableAtPoint(root, x, y, 0x0002, 30);
+                if (button is { } action)
+                {
+                    var command = NativeControlRef(root, null, action.Name,
+                        action.ClassName.Contains("Tab", StringComparison.OrdinalIgnoreCase)
+                            ? "ControlType.TabItem" : NativeButtonControlType(action.Handle), action.ClassName);
+                    if (command is not null)
+                        return Snapshot(AutomationElement.FromHandle(action.Handle), command);
+                }
+                var msaa = pointer != 0 && (GetAncestor(pointer, 2) == root ||
+                    GetAncestor(root, 2) == GetAncestor(pointer, 2))
+                    ? MsaaCommandAtPoint(x, y) : null;
+                if (msaa is { } accessible &&
+                    NativeControlRef(root, null, accessible.Name, accessible.Type, null) is { } legacy)
+                    return Snapshot(element, legacy);
+                element = FindActionableControlAtPoint(element, x, y) ?? element;
+            }
+            if (element.Current.ControlType == ControlType.Image &&
+                string.IsNullOrWhiteSpace(element.Current.Name) &&
+                string.IsNullOrWhiteSpace(element.Current.AutomationId))
+                element = NamedContainingImage(element, root, x, y) ?? element;
+            var current = element.Current;
+            if (current.IsOffscreen || !current.IsEnabled ||
+                current.BoundingRectangle.IsEmpty || !current.BoundingRectangle.Contains(x, y) ||
+                string.IsNullOrWhiteSpace(current.Name) && string.IsNullOrWhiteSpace(current.AutomationId))
+                return null;
+            var native = NativeControlRef(root, current.AutomationId, current.Name,
+                current.ControlType.ProgrammaticName, current.ClassName);
+            GetWindowThreadProcessId(root, out var processId);
+            if (native is null || current.ProcessId != processId) return null;
+            var parent = current.ControlType == ControlType.MenuItem
+                ? Automation.RecordedMenuParentName(element)
+                : TreeWalker.ControlViewWalker.GetParent(element)?.Current.Name;
+            return Snapshot(element, native with { ParentName = parent, ProcessId = (int)processId });
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or
+            System.Runtime.InteropServices.COMException)
+        { System.Diagnostics.Trace.WriteLine(ex); return null; }
+    }
+
+    private static AutomationElement? NamedContainingImage(AutomationElement hit, nint root, int x, int y)
+    {
+        GetWindowThreadProcessId(root, out var processId);
+        AutomationElement? named = null;
+        AutomationElement? element = hit;
+        for (var depth = 0; element is not null && depth < 12; depth++)
+        {
+            var current = element.Current;
+            if (current.ProcessId != processId) break;
+            if (current.ControlType == ControlType.Image && !string.IsNullOrWhiteSpace(current.Name) &&
+                current.IsEnabled && !current.IsOffscreen)
+            {
+                var bounds = ReadChartBounds(() => element.Current.BoundingRectangle);
+                if (!bounds.IsEmpty && bounds.Contains(x, y)) named = element;
+            }
+            if (current.NativeWindowHandle == root) break;
+            element = TreeWalker.RawViewWalker.GetParent(element);
+        }
+        return named;
     }
 
     private bool TryRecordNativeDialogClick(int x, int y)
@@ -1093,23 +2548,38 @@ internal sealed class Recorder : IDisposable
 
     private void RefreshDialogCacheAfterTab(nint window)
     {
+        InvalidateDialogCache(window);
         pendingWindowCaptures.Add(Task.Run(async () =>
         {
             await Task.Delay(180);
-            lock (dialogCacheLock) dialogControlCache.Remove(window);
+            InvalidateDialogCache(window);
             QueueDialogControlSnapshot(window);
         }));
     }
 
+    private void InvalidateDialogCache(nint window)
+    {
+        lock (dialogCacheLock)
+        {
+            dialogControlCache.Remove(window);
+            dialogCacheVersions[window] = dialogCacheVersions.GetValueOrDefault(window) + 1;
+        }
+    }
+
     private void QueueNativeCloseConfirmation(int index, nint root)
     {
+        RecordedEvent recorded;
+        lock (events) recorded = events[index];
         pendingWindowCaptures.Add(Task.Run(async () =>
         {
             for (var attempt = 0; attempt < 12; attempt++)
             {
                 await Task.Delay(100);
                 if (IsWindowVisible(root)) continue;
-                lock (events) events[index] = events[index] with { AfterState = "window-closed" };
+                lock (events)
+                    if (index < events.Count && events[index].At == recorded.At &&
+                        events[index].Target == recorded.Target)
+                        events[index] = events[index] with { AfterState = "window-closed" };
                 return;
             }
         }));
@@ -1137,6 +2607,86 @@ internal sealed class Recorder : IDisposable
         }
     }
 
+    private MouseDownSnapshot? CachedDialogCommandAtPoint(int x, int y)
+    {
+        var pointer = WindowFromPoint(new System.Drawing.Point(x, y));
+        var frame = pointer == 0 ? 0 : GetAncestor(pointer, 2);
+        if (frame == 0) return null;
+        lock (dialogCacheLock)
+        {
+            foreach (var (window, entry) in dialogControlCache)
+            {
+                if (!IsWindowVisible(window) || !IsWindowEnabled(window) ||
+                    GetAncestor(window, 2) != frame ||
+                    !GetWindowRect(window, out var bounds) || !bounds.Equals(entry.WindowBounds))
+                    continue;
+                var matches = entry.Controls.Where(control => control.Bounds.Contains(x, y) &&
+                    control.Type is "ControlType.Button" or "ControlType.RadioButton" or
+                        "ControlType.CheckBox" or "ControlType.TabItem" or "ControlType.Edit")
+                    .OrderBy(control => control.Bounds.Width * control.Bounds.Height).ToArray();
+                if (matches.Length == 0) continue;
+                GetWindowThreadProcessId(window, out var processId);
+                if (matches[0].Target.ProcessId != processId) continue;
+                var title = new System.Text.StringBuilder(512);
+                GetWindowText(window, title, title.Capacity);
+                if (title.Length > 0 && title.ToString() != matches[0].Target.Window) continue;
+                return new(null, matches[0].Target) { WindowHandle = window, IsDialog = true };
+            }
+        }
+        return null;
+    }
+
+    private void PrimeVisibleDialogCaches()
+    {
+        if (capturePausedByUser || capturePausedForIntent) return;
+        var foreground = GetForegroundWindow();
+        if (foreground == 0) return;
+        GetWindowThreadProcessId(foreground, out var processId);
+        void Consider(nint window)
+        {
+            if (!IsWindowVisible(window) || !GetWindowRect(window, out var bounds)) return;
+            if (!IsNativeDialogSurface(window)) return;
+            var screen = Screen.FromPoint(new System.Drawing.Point(bounds.Left, bounds.Top)).Bounds;
+            if ((long)(bounds.Right - bounds.Left) * (bounds.Bottom - bounds.Top) >=
+                (long)screen.Width * screen.Height * 8 / 10) return;
+            var caption = new System.Text.StringBuilder(512);
+            GetWindowText(window, caption, caption.Capacity);
+            if (caption.Length == 0 && GetWindow(window, 4) == 0) return;
+            var className = new System.Text.StringBuilder(128);
+            GetClassName(window, className, className.Capacity);
+            if (className.ToString().Contains("Button", StringComparison.OrdinalIgnoreCase) ||
+                IsNativeEditClass(className.ToString()) ||
+                className.ToString().Contains("Tab", StringComparison.OrdinalIgnoreCase)) return;
+            lock (dialogCacheLock)
+                if (dialogControlCache.TryGetValue(window, out var entry) &&
+                    entry.WindowBounds.Equals(bounds) &&
+                    DateTime.UtcNow - entry.At < TimeSpan.FromMilliseconds(500)) return;
+            QueueDialogControlSnapshot(window);
+        }
+        Consider(foreground);
+        EnumChildWindows(foreground, (child, _) => { Consider(child); return true; }, 0);
+        EnumWindows((window, _) =>
+        {
+            GetWindowThreadProcessId(window, out var owner);
+            if (owner == processId) Consider(window);
+            return true;
+        }, 0);
+    }
+
+    private static bool IsNativeDialogSurface(nint window)
+    {
+        var style = GetWindowLong(window, -16);
+        var owner = GetWindow(window, 4);
+        var childCaption = (style & 0x40000000) != 0 &&
+            (style & 0x00C00000) == 0x00C00000;
+        var ownedCaption = owner != 0 && (style & 0x00C00000) == 0x00C00000 &&
+            (IsWindowVisible(owner) || (style & 0x00020000) == 0);
+        return childCaption || ownedCaption ||
+            owner != 0 && IsWindowVisible(owner) && !IsWindowEnabled(owner);
+    }
+
+    [DllImport("user32.dll")] private static extern bool IsWindowEnabled(nint window);
+
     private void PrimeDialogCache(nint window)
     {
         if (window == 0) return;
@@ -1150,12 +2700,17 @@ internal sealed class Recorder : IDisposable
 
     private void QueueDialogControlSnapshot(nint window)
     {
-        if (window == 0 || !GetWindowRect(window, out var bounds)) return;
+        if (window == 0 || !IsNativeDialogSurface(window) ||
+            !GetWindowRect(window, out var bounds)) return;
         var screen = Screen.FromPoint(new System.Drawing.Point(bounds.Left, bounds.Top)).Bounds;
         if ((long)(bounds.Right - bounds.Left) * (bounds.Bottom - bounds.Top) >
             (long)screen.Width * screen.Height * 8 / 10) return;
+        int version;
         lock (dialogCacheLock)
+        {
             if (!queuedDialogSnapshots.Add(window)) return;
+            version = dialogCacheVersions.GetValueOrDefault(window);
+        }
         enrichmentQueue.Writer.TryWrite(() =>
         {
             try
@@ -1163,18 +2718,25 @@ internal sealed class Recorder : IDisposable
                 if (!IsWindowVisible(window)) return;
                 var dialog = AutomationElement.FromHandle(window);
                 RegisterDialogActionHandlers(window, dialog);
-                var children = dialog.FindAll(TreeScope.Descendants, Condition.TrueCondition);
-                var controls = new List<(string Name, string Type, System.Windows.Rect Bounds)>();
-                foreach (AutomationElement child in children)
+                var controls = new List<(string Name, string Type, System.Windows.Rect Bounds, ControlRef Target)>();
+                foreach (var child in RawDialogControls(dialog))
                 {
                     var state = child.Current;
-                    if (state.IsOffscreen || !IsActionableDialogElement(child) ||
-                        string.IsNullOrWhiteSpace(state.Name) ||
+                    if (state.IsOffscreen || (!IsActionableDialogElement(child) &&
+                        state.ControlType != ControlType.Edit && state.ClassName != "EDTBX") ||
+                        (string.IsNullOrWhiteSpace(state.Name) && string.IsNullOrWhiteSpace(state.AutomationId)) ||
                         state.BoundingRectangle.IsEmpty) continue;
-                    controls.Add((state.Name, state.ControlType.ProgrammaticName, state.BoundingRectangle));
+                    var target = Automation.Describe(child);
+                    if (target is null) continue;
+                    controls.Add((state.Name, state.ClassName == "EDTBX" ? "ControlType.Edit" :
+                        state.ControlType.ProgrammaticName, state.BoundingRectangle,
+                        target with { Window = dialog.Current.Name,
+                            ControlType = state.ClassName == "EDTBX" ? "ControlType.Edit" : target.ControlType }));
                 }
                 if (!GetWindowRect(window, out var finalBounds) || !finalBounds.Equals(bounds)) return;
-                lock (dialogCacheLock) dialogControlCache[window] = (DateTime.UtcNow, bounds, controls);
+                lock (dialogCacheLock)
+                    if (dialogCacheVersions.GetValueOrDefault(window) == version)
+                        dialogControlCache[window] = (DateTime.UtcNow, bounds, controls);
             }
             catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or
                 System.Runtime.InteropServices.COMException) { System.Diagnostics.Trace.WriteLine(ex); }
@@ -1309,8 +2871,10 @@ internal sealed class Recorder : IDisposable
     private void QueueDialogCommandRetry(int eventIndex, nint window, int x, int y)
     {
         if (window == 0) return;
-        ControlRef? expected;
-        lock (events) expected = eventIndex < events.Count ? events[eventIndex].Target : null;
+        RecordedEvent? recorded;
+        lock (events) recorded = eventIndex < events.Count ? events[eventIndex] : null;
+        if (recorded is null) return;
+        var expected = recorded.Target;
         pendingWindowCaptures.RemoveAll(task => task.IsCompleted);
         pendingWindowCaptures.Add(Task.Run(async () =>
         {
@@ -1319,19 +2883,24 @@ internal sealed class Recorder : IDisposable
                 await Task.Delay(attempt == 0 ? 75 : 150);
                 var live = ResolveDialogWindow(window, expected, x, y);
                 if (live == 0) continue;
-                var action = FindNativeActionableAtPoint(live, x, y, 0x20, 80);
-                var msaa = action is null ? MsaaActions.CommandAtPoint(live, x, y) : null;
-                if (action is null && msaa is null) continue;
-                var type = action is not null
-                    ? action.Value.ClassName.Contains("Tab", StringComparison.OrdinalIgnoreCase)
-                        ? "ControlType.TabItem" : "ControlType.Button"
-                    : msaa!.Value.Type;
-                var name = action?.Name ?? msaa!.Value.Name;
-                var corrected = NativeControlRef(live, null, name, type, null);
+                var rawPoint = new System.Drawing.Point(x, y);
+                var uia = FindDialogActionableAtPoint(live, rawPoint.X, rawPoint.Y);
+                var action = uia is null ? FindNativeActionableAtPoint(live, x, y, 0x20, 80) : null;
+                var msaa = uia is null && action is null ? MsaaActions.CommandAtPoint(live, x, y) : null;
+                if (uia is null && action is null && msaa is null) continue;
+                var corrected = uia;
+                if (corrected is null && action is { } native)
+                    corrected = NativeControlRef(live, null, native.Name,
+                        native.ClassName.Contains("Tab", StringComparison.OrdinalIgnoreCase)
+                            ? "ControlType.TabItem" : NativeButtonControlType(native.Handle),
+                        native.ClassName);
+                if (corrected is null && msaa is { } accessible)
+                    corrected = NativeControlRef(live, null, accessible.Name, accessible.Type, null);
                 if (corrected is null) return;
                 lock (events)
                 {
-                    if (eventIndex >= events.Count || events[eventIndex].ClickX != x ||
+                    if (eventIndex >= events.Count || events[eventIndex].At != recorded.At ||
+                        events[eventIndex].ClickX != x ||
                         events[eventIndex].ClickY != y ||
                         events[eventIndex].Target?.ControlType is not
                             ("ControlType.Window" or "ControlType.Pane" or "ControlType.Custom" or "ControlType.Tab"))
@@ -1342,6 +2911,32 @@ internal sealed class Recorder : IDisposable
                 return;
             }
         }));
+    }
+
+    private static ControlRef? FindDialogActionableAtPoint(nint window, int x, int y)
+    {
+        try
+        {
+            var root = AutomationElement.FromHandle(window);
+            var matches = root.FindAll(TreeScope.Descendants, Condition.TrueCondition)
+                .Cast<AutomationElement>()
+                .Select(element => (Element: element, State: element.Current))
+                .Where(item => !item.State.IsOffscreen && item.State.IsEnabled &&
+                    !string.IsNullOrWhiteSpace(item.State.Name) &&
+                    !item.State.BoundingRectangle.IsEmpty &&
+                    item.State.BoundingRectangle.Contains(x, y) &&
+                    IsActionableDialogElement(item.Element))
+                .OrderBy(item => item.State.BoundingRectangle.Width *
+                    item.State.BoundingRectangle.Height)
+                .FirstOrDefault();
+            return matches.Element is null ? null : Automation.Describe(matches.Element);
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or
+            System.Runtime.InteropServices.COMException)
+        {
+            System.Diagnostics.Trace.WriteLine(ex);
+            return null;
+        }
     }
 
     private static nint ResolveDialogWindow(nint captured, ControlRef? expected,
@@ -1376,8 +2971,10 @@ internal sealed class Recorder : IDisposable
     private void QueueDialogClickProbe(int eventIndex, nint window, int x, int y)
     {
         if (window == 0) return;
-        ControlRef? expected;
-        lock (events) expected = eventIndex < events.Count ? events[eventIndex].Target : null;
+        RecordedEvent? recorded;
+        lock (events) recorded = eventIndex < events.Count ? events[eventIndex] : null;
+        if (recorded is null) return;
+        var expected = recorded.Target;
         pendingProbeCaptures.RemoveAll(task => task.IsCompleted);
         pendingProbeCaptures.Add(Task.Run(async () =>
         {
@@ -1431,7 +3028,7 @@ internal sealed class Recorder : IDisposable
                     corrected = NativeControlRef(live, null, command.Name, command.Type, null);
                 var applied = false;
                 lock (events)
-                    if (eventIndex < events.Count)
+                    if (eventIndex < events.Count && events[eventIndex].At == recorded.At)
                     {
                         var current = events[eventIndex];
                         if (corrected is not null && current.ClickX == x && current.ClickY == y &&
@@ -1576,7 +3173,8 @@ internal sealed class Recorder : IDisposable
         try
         {
             if (hit.Current.ClassName == "EDTBX" || hit.Current.ControlType == ControlType.Edit ||
-                hit.TryGetCurrentPattern(ValuePattern.Pattern, out _)) return null;
+                hit.Current.ControlType != ControlType.Window &&
+                    hit.TryGetCurrentPattern(ValuePattern.Pattern, out _)) return null;
             var dialog = WindowAncestor(hit);
             if (dialog is null || IsActionableDialogElement(hit))
                 return null;
@@ -1584,6 +3182,15 @@ internal sealed class Recorder : IDisposable
             var screenBounds = Screen.FromPoint(new System.Drawing.Point(x, y)).Bounds;
             if (windowBounds.Width * windowBounds.Height > screenBounds.Width * screenBounds.Height * 0.8)
                 return null;
+            var ancestor = TreeWalker.RawViewWalker.GetParent(hit);
+            for (var depth = 0; ancestor is not null && depth < 6 && ancestor != dialog; depth++)
+            {
+                if (IsActionableDialogElement(ancestor) &&
+                    ancestor.Current.ProcessId == dialog.Current.ProcessId &&
+                    ancestor.Current.BoundingRectangle.Contains(x, y))
+                    return ancestor;
+                ancestor = TreeWalker.RawViewWalker.GetParent(ancestor);
+            }
             // Some dialogs report their window or pane at a child control's point.
             // Search only this small dialog and verify the control contains the click.
             var nativeChild = WindowFromPoint(new System.Drawing.Point(x, y));
@@ -1591,11 +3198,26 @@ internal sealed class Recorder : IDisposable
             {
                 var nativeElement = AutomationElement.FromHandle(nativeChild);
                 if (IsActionableDialogElement(nativeElement) &&
+                    nativeElement.Current.ProcessId == dialog.Current.ProcessId &&
                     nativeElement.Current.BoundingRectangle.Contains(x, y))
                     return nativeElement;
             }
-            var controls = dialog.FindAll(TreeScope.Descendants, Condition.TrueCondition);
-            return controls.Cast<AutomationElement>()
+            // Raw View includes owner-drawn option controls hidden from Control View.
+            var controls = new List<AutomationElement>();
+            var queue = new Queue<AutomationElement>();
+            queue.Enqueue(dialog);
+            while (queue.Count > 0 && controls.Count < 300)
+            {
+                var current = queue.Dequeue();
+                controls.Add(current);
+                var child = TreeWalker.RawViewWalker.GetFirstChild(current);
+                while (child is not null && queue.Count + controls.Count < 300)
+                {
+                    queue.Enqueue(child);
+                    child = TreeWalker.RawViewWalker.GetNextSibling(child);
+                }
+            }
+            return controls
                 .Where(control => IsActionableDialogElement(control) &&
                     control.Current.BoundingRectangle.Contains(x, y))
                 .OrderBy(control => control.Current.BoundingRectangle.Width * control.Current.BoundingRectangle.Height)
@@ -1611,15 +3233,37 @@ internal sealed class Recorder : IDisposable
         try
         {
             var state = element.Current;
+            if (state.ControlType == ControlType.Window || state.ControlType == ControlType.Group)
+                return false;
             return state.IsEnabled && !state.IsOffscreen &&
                 !string.IsNullOrWhiteSpace(state.Name) &&
                 (state.ControlType == ControlType.Button || state.ControlType == ControlType.TabItem ||
+                 state.ControlType == ControlType.RadioButton || state.ControlType == ControlType.CheckBox ||
                  element.TryGetCurrentPattern(InvokePattern.Pattern, out _) ||
                  element.TryGetCurrentPattern(SelectionItemPattern.Pattern, out _) ||
                  element.TryGetCurrentPattern(TogglePattern.Pattern, out _));
         }
         catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or
             System.Runtime.InteropServices.COMException) { return false; }
+    }
+
+    private static IEnumerable<AutomationElement> RawDialogControls(AutomationElement dialog)
+    {
+        var queue = new Queue<AutomationElement>();
+        queue.Enqueue(dialog);
+        var visited = 0;
+        while (queue.Count > 0 && visited < 300)
+        {
+            var current = queue.Dequeue();
+            visited++;
+            yield return current;
+            var child = TreeWalker.RawViewWalker.GetFirstChild(current);
+            while (child is not null && visited + queue.Count < 300)
+            {
+                queue.Enqueue(child);
+                child = TreeWalker.RawViewWalker.GetNextSibling(child);
+            }
+        }
     }
 
     private static (nint Handle, string Name, string ClassName)? FindNativeActionableAtPoint(int x, int y)
@@ -1687,6 +3331,8 @@ internal sealed class Recorder : IDisposable
                 0x0C => "ControlType.MenuItem", // ROLE_SYSTEM_MENUITEM
                 0x2B => "ControlType.Button", // ROLE_SYSTEM_PUSHBUTTON
                 0x25 => "ControlType.TabItem", // ROLE_SYSTEM_PAGETAB
+                0x2C => "ControlType.CheckBox",
+                0x2D => "ControlType.RadioButton",
                 _ => null
             } : null;
             if (type is null) return null;
@@ -1850,30 +3496,36 @@ internal sealed class Recorder : IDisposable
 
     private void FinishTypingCapture()
     {
-        typingCapture.Stop();
-        for (var index = events.Count - 1; index >= 0 && events[index].Kind == "key"; index--)
+        if (Interlocked.Exchange(ref finishingTypingCapture, 1) != 0) return;
+        try
         {
-            if (ActionGrouper.IsStandaloneModifier(events[index].Key)) continue;
-            if (events[index].Target is { } target && IsEditableTarget(target, cachedEditableElement) &&
-                events[index].Key is not ("Enter" or "Return"))
-                CaptureCompletedField(index, target, cachedEditableElement);
-            if (events[index].Key is "Enter" or "Return" &&
-                events[index].Target?.Process?.Equals("EXCEL", StringComparison.OrdinalIgnoreCase) == true)
+            typingCapture.Stop();
+            for (var index = events.Count - 1; index >= 0 && events[index].Kind == "key"; index--)
             {
-                try
+                if (ActionGrouper.IsStandaloneModifier(events[index].Key)) continue;
+                if (events[index].Target is { } target && IsEditableTarget(target, cachedEditableElement) &&
+                    events[index].AfterState?.StartsWith("excel-selection-range:", StringComparison.Ordinal) != true &&
+                    events[index].Key is not ("Enter" or "Return"))
+                    CaptureCompletedField(index, target, cachedEditableElement);
+                if (events[index].Key is "Enter" or "Return" &&
+                    events[index].Target?.Process?.Equals("EXCEL", StringComparison.OrdinalIgnoreCase) == true)
                 {
-                    var window = GetForegroundWindow();
-                    var selected = window == 0 ? null : SelectedTab(AutomationElement.FromHandle(window));
-                    if (selected is not null)
-                        events[index] = events[index] with { AfterState = "sheet-name:" + selected.Current.Name };
+                    try
+                    {
+                        var window = GetForegroundWindow();
+                        var selected = window == 0 ? null : SelectedTab(AutomationElement.FromHandle(window));
+                        if (selected is not null)
+                            events[index] = events[index] with { AfterState = "sheet-name:" + selected.Current.Name };
+                    }
+                    catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or
+                        System.Runtime.InteropServices.COMException) { System.Diagnostics.Trace.WriteLine(ex); }
                 }
-                catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or
-                    System.Runtime.InteropServices.COMException) { System.Diagnostics.Trace.WriteLine(ex); }
+                if (events[index].Screenshot is null && events[index].Target?.Window != "Find and Replace")
+                    events[index] = events[index] with { Screenshot = Capture(typingScreen) };
+                break;
             }
-            if (events[index].Screenshot is null && events[index].Target?.Window != "Find and Replace")
-                events[index] = events[index] with { Screenshot = Capture(typingScreen) };
-            break;
         }
+        finally { Volatile.Write(ref finishingTypingCapture, 0); }
     }
 
     private void CaptureCompletedField(int index, ControlRef target, AutomationElement? knownField)
@@ -2175,7 +3827,9 @@ internal sealed class Recorder : IDisposable
         enrichmentQueue.Writer.TryComplete();
         try { enrichmentWorker.Wait(TimeSpan.FromSeconds(2)); }
         catch (AggregateException ex) { System.Diagnostics.Trace.WriteLine(ex); }
-        typingCapture.Dispose(); clickCapture.Dispose(); scrollCapture.Dispose();
+        typingCapture.Dispose(); clickCapture.Dispose(); scrollCapture.Dispose(); chartHoverCapture.Dispose(); legendOutcomeCapture.Dispose();
+        chartSampleRequested.Dispose();
+        hookDispatcher.Dispose();
     }
 
     private static string? TextCharacter(KeyboardInfo info, string modifiers)
@@ -2238,6 +3892,7 @@ internal sealed class Recorder : IDisposable
     [DllImport("user32.dll")] private static extern bool GetKeyboardState(byte[] state);
     [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] private static extern nint GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern nint GetWindow(nint window, uint command);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(nint window, out uint processId);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(nint window);
     [DllImport("user32.dll")] private static extern bool IsWindow(nint window);

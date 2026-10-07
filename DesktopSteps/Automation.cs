@@ -5,6 +5,118 @@ namespace DesktopSteps;
 
 internal static class Automation
 {
+    internal static AutomationElement? ResolveUniqueEmbeddedButton(ControlRef target)
+    {
+        if (target is not { Process: { Length: > 0 }, Name: { Length: > 0 },
+                ParentName: { Length: > 0 }, ControlType: "ControlType.Button" }) return null;
+        var matches = new List<AutomationElement>();
+        foreach (AutomationElement window in AutomationElement.RootElement.FindAll(TreeScope.Children,
+            Condition.TrueCondition))
+        {
+            try
+            {
+                if (!Process.GetProcessById(window.Current.ProcessId).ProcessName.Equals(target.Process,
+                        StringComparison.OrdinalIgnoreCase)) continue;
+                foreach (AutomationElement button in window.FindAll(TreeScope.Descendants, new AndCondition(
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                    new PropertyCondition(AutomationElement.NameProperty, target.Name))))
+                {
+                    if (!button.Current.IsEnabled || button.Current.IsOffscreen) continue;
+                    var ancestor = TreeWalker.ControlViewWalker.GetParent(button);
+                    for (var depth = 0; depth < 8 && ancestor is not null; depth++)
+                    {
+                        if (ancestor.Current.Name.Equals(target.ParentName,
+                                StringComparison.OrdinalIgnoreCase))
+                        { matches.Add(button); break; }
+                        ancestor = TreeWalker.ControlViewWalker.GetParent(ancestor);
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is ElementNotAvailableException or ArgumentException or
+                InvalidOperationException or System.Runtime.InteropServices.COMException)
+            { Trace.WriteLine(ex); }
+        }
+        if (matches.Count > 1)
+            throw new InvalidOperationException($"Multiple visible '{target.Name}' buttons matched embedded dialog '{target.ParentName}'.");
+        return matches.SingleOrDefault();
+    }
+
+    internal static AutomationElement? ResolveUniqueRefreshCommand(ControlRef target, ControlRef? context = null)
+    {
+        var matches = new List<AutomationElement>();
+        var seenWindows = new HashSet<string>(StringComparer.Ordinal);
+        var seenCommands = new HashSet<string>(StringComparer.Ordinal);
+        foreach (AutomationElement window in AutomationElement.RootElement.FindAll(TreeScope.Children,
+            new PropertyCondition(AutomationElement.NameProperty, target.Window)))
+        {
+            if (!Process.GetProcessById(window.Current.ProcessId).ProcessName.Equals(target.Process,
+                    StringComparison.OrdinalIgnoreCase) || !window.Current.IsEnabled) continue;
+            if (!seenWindows.Add(ElementIdentity(window))) continue;
+            foreach (AutomationElement button in window.FindAll(TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button)))
+            {
+                var current = button.Current;
+                if (current.IsEnabled && !current.IsOffscreen &&
+                    System.Text.RegularExpressions.Regex.IsMatch(current.Name,
+                        @"^Refresh(?:\s+(?:View|Now))?$",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase) &&
+                    seenCommands.Add(VisibleCommandIdentity(button)))
+                    matches.Add(button);
+            }
+        }
+        if (matches.Count > 1 && context is not null && Resolve(context, 3000) is { } contextElement)
+        {
+            var contextBounds = contextElement.Current.BoundingRectangle;
+            var ranked = matches.Select(element =>
+            {
+                var bounds = element.Current.BoundingRectangle;
+                var vertical = bounds.Bottom <= contextBounds.Top
+                    ? contextBounds.Top - bounds.Bottom : Math.Abs(bounds.Top - contextBounds.Top) + 10000;
+                var horizontal = Math.Abs((bounds.Left + bounds.Width / 2) -
+                    (contextBounds.Left + contextBounds.Width / 2));
+                return (Element: element, Score: vertical * 4 + horizontal);
+            }).OrderBy(candidate => candidate.Score).ToArray();
+            if (ranked.Length > 0 && (ranked.Length == 1 || ranked[0].Score + 2 < ranked[1].Score))
+                return ranked[0].Element;
+        }
+        if (matches.Count > 1)
+            throw new InvalidOperationException("Multiple enabled Refresh commands matched the explicit fallback; no command was invoked.");
+        return matches.SingleOrDefault();
+    }
+
+    private static string ElementIdentity(AutomationElement element)
+    {
+        var current = element.Current;
+        if (current.NativeWindowHandle != 0)
+            return $"hwnd:{current.NativeWindowHandle}";
+        try
+        {
+            if (element.GetRuntimeId() is { Length: > 0 } runtimeId)
+                return "runtime:" + string.Join(',', runtimeId);
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or
+            System.Runtime.InteropServices.COMException)
+        { Trace.WriteLine(ex); }
+        var bounds = current.BoundingRectangle;
+        return string.Join('|', current.ProcessId, current.ControlType.ProgrammaticName,
+            current.AutomationId, current.ClassName, current.Name,
+            bounds.Left, bounds.Top, bounds.Width, bounds.Height);
+    }
+
+    private static string VisibleCommandIdentity(AutomationElement element)
+    {
+        var current = element.Current;
+        var bounds = current.BoundingRectangle;
+        // Some WinForms providers publish the same visible form through two native
+        // top-level handles and give each descendant a different UIA runtime ID.
+        // A command occupying the same screen rectangle with the same semantic
+        // identity is one visible command. Distinct Refresh buttons remain distinct
+        // because their rectangles differ.
+        return string.Join('|', current.ProcessId, current.ControlType.ProgrammaticName,
+            current.AutomationId, current.ClassName, current.Name,
+            bounds.Left, bounds.Top, bounds.Width, bounds.Height);
+    }
+
     private static readonly object TabStripLock = new();
     private static readonly Dictionary<(int Window, string Id), AutomationElement> TabStripCache = [];
 
@@ -303,6 +415,39 @@ internal static class Automation
         catch (ElementNotAvailableException) { return null; }
     }
 
+    public static string? MenuParentName(AutomationElement element)
+    {
+        try
+        {
+            var parent = TreeWalker.ControlViewWalker.GetParent(element);
+            for (var depth = 0; parent is not null && depth < 4; depth++)
+            {
+                if ((parent.Current.ControlType == ControlType.Menu ||
+                     parent.Current.ControlType == ControlType.MenuItem) &&
+                    !string.IsNullOrWhiteSpace(parent.Current.Name))
+                    return parent.Current.Name;
+                parent = TreeWalker.ControlViewWalker.GetParent(parent);
+            }
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or
+            System.Runtime.InteropServices.COMException) { Trace.WriteLine(ex); }
+        return null;
+    }
+
+    public static string? RecordedMenuParentName(AutomationElement element)
+    {
+        // Embedded menu-like controls (for example grid dropdowns) are scoped
+        // by their immediate data/header parent, not a popup menu ancestor.
+        if (!string.IsNullOrWhiteSpace(element.Current.AutomationId))
+        {
+            var parent = TreeWalker.ControlViewWalker.GetParent(element);
+            if (parent is not null && (parent.Current.ControlType == ControlType.DataItem ||
+                parent.Current.ControlType == ControlType.HeaderItem))
+                return parent.Current.Name;
+        }
+        return MenuParentName(element);
+    }
+
     public static string? State(AutomationElement? element)
     {
         if (element is null) return null;
@@ -364,17 +509,18 @@ internal static class Automation
                     var name = Process.GetProcessById(w.ProcessId).ProcessName;
                     if (!name.Equals(target.Process, StringComparison.OrdinalIgnoreCase)) continue;
                 }
-                // Large native dialogs can put an Edit beyond the bounded Control View
-                // traversal. Its recorded AutomationId remains the strongest locator.
-                if (target.ControlType == "ControlType.Edit" &&
+                // Large control trees can exceed bounded traversal; query stable IDs directly.
+                if (target.ControlType is "ControlType.Edit" or "ControlType.Button" &&
                     !string.IsNullOrWhiteSpace(target.AutomationId))
                 {
-                    var direct = window.FindFirst(TreeScope.Descendants, new AndCondition(
+                    var directMatches = window.FindAll(TreeScope.Descendants, new AndCondition(
                         new PropertyCondition(AutomationElement.AutomationIdProperty, target.AutomationId),
-                        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit)));
-                    if (direct is not null && Matches(direct, target) &&
-                        direct.Current.IsEnabled && !direct.Current.IsOffscreen)
-                        return direct;
+                        new PropertyCondition(AutomationElement.ControlTypeProperty,
+                            target.ControlType == "ControlType.Edit" ? ControlType.Edit : ControlType.Button)))
+                        .Cast<AutomationElement>().Where(node => Matches(node, target) &&
+                            node.Current.IsEnabled && !node.Current.IsOffscreen).ToList();
+                    if (directMatches.Count == 1) return directMatches[0];
+                    if (directMatches.Count > 1) return null;
                 }
                 // Document titles often change after each character; prefer the old title but
                 // allow the process and control identity to locate the same editor later.
@@ -476,7 +622,10 @@ internal static class Automation
     public static AutomationElement? ResolveMenuItem(ControlRef target)
     {
         if (string.IsNullOrWhiteSpace(target.Name)) return null;
-        var condition = new AndCondition(
+        var columnFilter = target is { Process: "EXCEL", AutomationId: "Dropdown", ParentName: { Length: > 0 } };
+        Condition condition = columnFilter
+            ? new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem)
+            : new AndCondition(
             new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
             new PropertyCondition(AutomationElement.NameProperty, target.Name));
         if (!string.IsNullOrWhiteSpace(target.AutomationId) && !string.IsNullOrWhiteSpace(target.ParentName))
@@ -506,20 +655,10 @@ internal static class Automation
             }
             return null; // A different column's identical button is never a safe fallback.
         }
-        try
-        {
-            var focused = AutomationElement.FocusedElement;
-            for (var depth = 0; focused is not null && depth < 6; depth++)
-            {
-                if (focused.Current.ControlType == ControlType.MenuItem && focused.Current.Name == target.Name)
-                    return focused;
-                var nearby = focused.FindFirst(TreeScope.Descendants, condition);
-                if (nearby is not null) return nearby;
-                focused = TreeWalker.ControlViewWalker.GetParent(focused);
-            }
-        }
-        catch (Exception e) when (e is ElementNotAvailableException or InvalidOperationException) { }
+        // Walking focused ancestors can reach the desktop and search every
+        // application's tree. Search only the recorded process's live windows.
         var windows = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition);
+        var matches = new List<AutomationElement>();
         foreach (AutomationElement window in windows)
         {
             try
@@ -527,12 +666,23 @@ internal static class Automation
                 if (!string.IsNullOrWhiteSpace(target.Process) &&
                     !Process.GetProcessById(window.Current.ProcessId).ProcessName.Equals(target.Process, StringComparison.OrdinalIgnoreCase))
                     continue;
-                var item = window.FindFirst(TreeScope.Descendants, condition);
-                if (item is not null) return item;
+                var items = window.FindAll(TreeScope.Descendants, condition);
+                foreach (AutomationElement item in items)
+                {
+                    if (!item.Current.IsEnabled || item.Current.IsOffscreen ||
+                        !string.IsNullOrWhiteSpace(target.AutomationId) &&
+                        item.Current.AutomationId != target.AutomationId) continue;
+                    if (!string.IsNullOrWhiteSpace(target.ParentName) &&
+                        !string.Equals(MenuParentName(item), target.ParentName,
+                            StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!matches.Contains(item)) matches.Add(item);
+                    if (matches.Count > 1) return null;
+                }
             }
-            catch (Exception e) when (e is ElementNotAvailableException or ArgumentException or InvalidOperationException) { }
+            catch (Exception e) when (e is ElementNotAvailableException or ArgumentException or InvalidOperationException or
+                System.Runtime.InteropServices.COMException) { System.Diagnostics.Trace.WriteLine(e); }
         }
-        return null;
+        return matches.SingleOrDefault();
     }
 
     public static AutomationElement? FindSelectedListRow(ControlRef target)

@@ -10,7 +10,7 @@ internal static class AzureCli
             .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
             .Select(directory => Path.Combine(directory.Trim('"'), "az.cmd"))
             .FirstOrDefault(File.Exists)
-            ?? throw new FileNotFoundException("Azure CLI was not found on PATH. Install Azure CLI and restart Desktop Steps.");
+            ?? throw new FileNotFoundException("Azure CLI was not found on PATH. Install Azure CLI and restart RSR.");
         var python = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(az)!, "..", "python.exe"));
         var info = new ProcessStartInfo(File.Exists(python) ? python : az)
         {

@@ -22,10 +22,10 @@ public sealed record DialogFieldSnapshot(ControlRef Target, string Value);
 public sealed record PlanStep(int Number, string Action, ControlRef? Target, string? Value,
     string? Key, string? ExpectedState, string? Screenshot, string? Explanation,
     string? Intent = null, string? RelativeWeekday = null, string? WhenUser = null,
-    string? TargetStrategy = null);
+    string? TargetStrategy = null, string? OriginIntent = null);
 
 public sealed record ExecutionPlan(int Version, DateTimeOffset Created, string Summary,
-    List<PlanStep> Steps);
+    List<PlanStep> Steps, int? RefreshExpectedSeconds = null);
 
 internal static class JsonFile
 {

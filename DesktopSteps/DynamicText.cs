@@ -12,8 +12,7 @@ internal static class DynamicText
     public static string ToTemplate(string text, string? relativeWeekday)
     {
         if (string.IsNullOrWhiteSpace(relativeWeekday)) return text;
-        if (!Enum.TryParse<DayOfWeek>(relativeWeekday, true, out var weekday))
-            throw new InvalidOperationException($"Unknown relative weekday: {relativeWeekday}.");
+        var weekday = ParseWeekday(relativeWeekday);
         if (Token.IsMatch(text)) return StaleDateBeforeToken.Replace(text, "");
         var matches = Date.Matches(text);
         if (matches.Count == 0) return $"{text.TrimEnd()} ({{{{next:{weekday}:d MMM yy}}}})";
@@ -38,12 +37,19 @@ internal static class DynamicText
 
     private static DateTime NextDate(string relativeWeekday, DateTime? runDate)
     {
-        if (!Enum.TryParse<DayOfWeek>(relativeWeekday, true, out var weekday))
-            throw new InvalidOperationException($"Unknown relative weekday: {relativeWeekday}.");
+        var weekday = ParseWeekday(relativeWeekday);
         var today = (runDate ?? DateTime.Today).Date;
         var days = ((int)weekday - (int)today.DayOfWeek + 7) % 7;
         if (days == 0) days = 7; // "next" always means a future occurrence.
         return today.AddDays(days);
+    }
+
+    private static DayOfWeek ParseWeekday(string relativeWeekday)
+    {
+        var normalized = Regex.Replace(relativeWeekday.Trim(), @"^next\s+", "", RegexOptions.IgnoreCase);
+        if (!Enum.TryParse<DayOfWeek>(normalized, true, out var weekday))
+            throw new InvalidOperationException($"Unknown relative weekday: {relativeWeekday}.");
+        return weekday;
     }
 
     private static string Format(Match match) =>

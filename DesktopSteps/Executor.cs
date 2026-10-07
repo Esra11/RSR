@@ -7,12 +7,102 @@ using System.Windows.Automation;
 
 namespace DesktopSteps;
 
+// Replays validated plans through UI Automation first, then narrowly scoped native
+// fallbacks. Each fallback verifies live application, window and control identity so
+// recorded workflows can survive UI changes without turning into coordinate macros.
 internal static class Executor
 {
+    internal static ControlRef? FindPasteDestination(IReadOnlyList<PlanStep> steps, int pasteIndex)
+    {
+        var paste = steps[pasteIndex];
+        for (var index = pasteIndex - 1; index >= Math.Max(0, pasteIndex - 6); index--)
+        {
+            var step = steps[index];
+            if (step.Action != "click" || step.WhenUser != paste.WhenUser ||
+                step.Target is not { Process: "EXCEL" } target ||
+                target.Window != paste.Target?.Window) return null;
+            if (target is { ControlType: "ControlType.DataItem", ClassName: "XLSpreadsheetCell" })
+                return target;
+            if (target is { ClassName: "NetUIRibbonTab", AutomationId: { } id } &&
+                id.StartsWith("Tab", StringComparison.Ordinal)) continue;
+            if (target is { Name: "Back", AutomationId: "FileTabButton",
+                    ClassName: "NetUISimpleButton", ParentName: "File" } &&
+                index > 0 && steps[index - 1] is { Action: "click",
+                    Target: { Process: "EXCEL", AutomationId: "FileTabButton",
+                        ClassName: "NetUIRibbonTab", Name: "File Tab" } file } &&
+                file.Window == target.Window && steps[index - 1].WhenUser == paste.WhenUser)
+            {
+                index--;
+                continue;
+            }
+            return null;
+        }
+        return null;
+    }
+
     public static async Task<bool> ReplayAsync(ExecutionPlan plan, Action<string> status,
         Func<string, bool> handleUnexpectedDialog, Func<string, bool> approveBrowserChange,
         CancellationToken token)
     {
+        if (plan.RefreshExpectedSeconds is { } expected &&
+            (expected < 1 || expected > int.MaxValue - 2))
+            throw new InvalidDataException("Refresh expected seconds must be a positive whole number with room for the two-second buffer.");
+        var refreshTimeout = TimeSpan.FromSeconds(plan.RefreshExpectedSeconds is { } seconds ? seconds + 2 : 20);
+        if (plan.Steps.FirstOrDefault(step => step.Action == "unresolved-input") is { } unresolved)
+            throw new InvalidOperationException($"Step {unresolved.Number}: delayed input has no verified target. Re-record this section; replay stopped before changing applications.");
+        foreach (var sourceStep in plan.Steps.Where(step => step.Action == "set-chart-source-range"))
+        {
+            if (sourceStep.Target is not { Process: "EXCEL", ClassName: "ExcelChartObject", Name: { Length: > 0 } } ||
+                sourceStep.ExpectedState != "chart-source-verified" || sourceStep.Value is null)
+                throw new InvalidDataException("Chart source action has no verified recorded chart outcome.");
+            ExcelNativeSheet.ValidateChartSource(
+                System.Text.Json.JsonSerializer.Deserialize<ExcelNativeSheet.ChartSource>(sourceStep.Value)
+                ?? throw new InvalidDataException("Captured chart source is missing."));
+        }
+        if (plan.Steps.FirstOrDefault(step => step.Action == "context-click" &&
+            step.Target is { Process: "EXCEL", ControlType: "ControlType.Image", ParentName: "Chart Area" } chart &&
+            string.IsNullOrWhiteSpace(chart.Name)) is { } unidentifiedChart)
+            throw new InvalidOperationException($"Step {unidentifiedChart.Number}: the recording did not save the chart identity. Re-record the chart source selection and legend resize with this build; replay stopped before changing applications.");
+        if (plan.Steps.FirstOrDefault(step => step.Action == "filter-values" &&
+            step.ExpectedState is not ("filter:only" or "filter:exclude" or "filter:all")) is { } ambiguousFilter)
+            throw new InvalidOperationException($"Step {ambiguousFilter.Number}: confirm the final filter selection before replay. No worksheet changes were made.");
+        if (plan.Steps.FirstOrDefault(step => ExcelFilterPlan.IsItem(step.Target)) is { } ungroupedFilter)
+            throw new InvalidOperationException($"Step {ungroupedFilter.Number}: the filter checklist has no complete, verified apply sequence. Rebuild or re-record this filter before replay; no worksheet changes were made.");
+        for (var index = 0; index < plan.Steps.Count; index++)
+        {
+            if (plan.Steps[index].TargetStrategy == "first-visible-filtered-row" &&
+                (index + 1 >= plan.Steps.Count || plan.Steps[index + 1].Action != "fill-down-to-adjacent-data-end" ||
+                 plan.Steps[index + 1].Target?.Window != plan.Steps[index].Target?.Window))
+                throw new InvalidDataException("A first-visible filtered input must be followed by its same-workbook visible fill operation.");
+            if (plan.Steps[index].Action == "optional-click" &&
+                (index + 1 >= plan.Steps.Count || plan.Steps[index + 1].Action != "click-if-previous-absent" ||
+                 plan.Steps[index].Target?.Process != plan.Steps[index + 1].Target?.Process))
+                throw new InvalidDataException("An intent-generated optional dialog must have its recorded fallback command immediately after it.");
+            if (plan.Steps[index].TargetStrategy == "last-populated-row-in-first-column" &&
+                (index + 1 >= plan.Steps.Count || plan.Steps[index + 1] is not
+                    { Action: "update-cell-to-relative-weekday",
+                      TargetStrategy: "copied-live-last-row-date-and-formulas" } ||
+                 plan.Steps[index + 1].Target?.Window != plan.Steps[index].Target?.Window))
+                // The update consumes addresses resolved by the immediately preceding
+                // live append. Refuse the entire replay before touching Excel if plan
+                // compaction ever separates this safety-critical pair.
+                throw new InvalidDataException("A live previous-row copy must be immediately followed by its same-workbook date and formula update.");
+        }
+        foreach (var filter in plan.Steps.Where(step => step.Action == "click" &&
+            step.Target is { AutomationId: "Dropdown", ControlType: "ControlType.MenuItem" } &&
+            string.IsNullOrWhiteSpace(step.Target.ParentName)))
+            throw new InvalidOperationException($"Step {filter.Number}: the recorder did not save the column parent " +
+                $"for filter '{filter.Target!.Name}'. Replay stopped before changing applications because identical " +
+                "filter buttons cannot be distinguished safely. Record this action again with the corrected recorder.");
+        foreach (var filter in plan.Steps.Where(step => step.Action == "filter-values"))
+        {
+            if (filter.Target is not { Process: "EXCEL", AutomationId: "Dropdown", ParentName: { Length: > 0 } })
+                throw new InvalidDataException($"Step {filter.Number}: verified filtering requires a recorded column parent and dropdown ID.");
+            var values = ExcelFilterPlan.Values(filter);
+            if (filter.ExpectedState == "filter:only" && values.Length == 0 ||
+                values.Any(value => string.IsNullOrWhiteSpace(value) || value == "(Select All)"))
+                throw new InvalidDataException($"Step {filter.Number}: invalid or empty filter values; replay stopped before worksheet changes.");
+        }
         // An older recorder could append an unresolved row-menu click after a
         // later Select All click. The duplicate Select All makes that exact
         // ordering error identifiable without changing any other plan steps.
@@ -149,7 +239,15 @@ internal static class Executor
         string? pendingExcelFollowingRowValue = null;
         nint tuckedAwayDialog = 0;
         var replacementDialogOpen = false;
+        var priorConditionalControlWasAbsent = false;
+        PlanStep? pendingOptionalStep = null;
         var resolvedGridTargets = new Dictionary<string, ControlRef>(StringComparer.OrdinalIgnoreCase);
+        var liveFilteredSources = new Dictionary<int, ControlRef>();
+        var filteredWorkbooks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var renamedSheetReferences = new List<(string Window, string Template, string Name)>();
+        object?[,]? copiedExcelValues = null;
+        TablePaste? lastVerifiedPaste = null;
+        ExcelNativeSheet.DuplicatedRow? lastDynamicDuplicatedRow = null;
         var approvedBrowserWindows = new HashSet<nint>();
         int? freshBrowserProcessId = null;
         int? selectedBrowserProcessId = null;
@@ -159,6 +257,421 @@ internal static class Executor
         {
             var step = plan.Steps[index];
             token.ThrowIfCancellationRequested();
+            if (PlanCompactor.IsChartSelectionBeforeLayout(step,
+                    index + 1 < plan.Steps.Count ? plan.Steps[index + 1] : null))
+            {
+                status($"Skipped step {step.Number}: the following verified legend-layout action targets the same chart directly.");
+                continue;
+            }
+            if (step is { Action: "set-chart-source-range", Target: { Process: "EXCEL", Name: { Length: > 0 } } chartTarget,
+                    Value: { } sourceValue })
+            {
+                var source = System.Text.Json.JsonSerializer.Deserialize<ExcelNativeSheet.ChartSource>(sourceValue)
+                    ?? throw new InvalidDataException("Captured chart source is missing.");
+                ExcelNativeSheet.ValidateChartSource(source);
+                var aliases = renamedSheetReferences.Where(rename => rename.Window == chartTarget.Window &&
+                    IsDatedSheetReference(rename.Template, source.Sheet) && rename.Name == lastVerifiedPaste?.Sheet).ToList();
+                if (aliases.Count > 1) throw new InvalidOperationException("Captured chart sheet has multiple rename matches.");
+                if (aliases.Count == 1) source = source with { Sheet = aliases[0].Name };
+                var handle = FindDesktopWindow(chartTarget.Process, chartTarget.Window);
+                ExcelNativeSheet.Read<bool>(handle, sheet =>
+                {
+                    ExcelNativeSheet.ApplyChartSource(sheet, chartTarget.Name, source, lastVerifiedPaste);
+                    return true;
+                });
+                status($"Completed step {step.Number}: applied and verified the captured chart source for {chartTarget.Name}.");
+                continue;
+            }
+            if (step is { Action: "set-chart-legend-layout", Target: { Process: { Length: > 0 }, Name: { Length: > 0 } } layoutTarget,
+                    Value: { } legendLayout })
+            {
+                var handle = FindDesktopWindow(layoutTarget.Process, layoutTarget.Window);
+                if (step.ExpectedState?.StartsWith("chart-legend-sheet:", StringComparison.Ordinal) != true)
+                    throw new InvalidDataException("Legend resize has no recorded worksheet identity.");
+                var layoutSheet = step.ExpectedState["chart-legend-sheet:".Length..];
+                var layoutAliases = renamedSheetReferences.Where(rename =>
+                    rename.Window == layoutTarget.Window && IsDatedSheetReference(rename.Template, layoutSheet) &&
+                    rename.Name == lastVerifiedPaste?.Sheet).ToList();
+                if (layoutAliases.Count > 1)
+                    throw new InvalidOperationException("Legend worksheet matches multiple renamed sheets; no resize was applied.");
+                if (layoutAliases.Count == 1) layoutSheet = layoutAliases[0].Name;
+                TableReplayAdapters.Require(handle, TableCapability.ChartLayout)
+                    .SetLegendLayout(handle, layoutTarget.Name,
+                        layoutSheet, legendLayout);
+                status($"Completed step {step.Number}: restored and verified the recorded legend layout in {layoutTarget.Name}.");
+                continue;
+            }
+            if (step is { Action: "expand-chart-legend-opposite-plot",
+                Target: { Process: { Length: > 0 }, Name: { Length: > 0 } } expandedLegendTarget })
+            {
+                var handle = FindDesktopWindow(expandedLegendTarget.Process, expandedLegendTarget.Window);
+                if (handle == 0) throw new InvalidOperationException("Workbook unavailable for the chart legend operation.");
+                TableReplayAdapters.Require(handle, TableCapability.ChartLayout)
+                    .ExpandLegendOppositePlot(handle, expandedLegendTarget.Name);
+                status($"Completed step {step.Number}: expanded {expandedLegendTarget.Name}'s legend across the side opposite its plot.");
+                continue;
+            }
+            if (step is { Action: "set-chart-source-from-last-paste", Target: { Process: { Length: > 0 } }, Value: { } chartName })
+            {
+                if (lastVerifiedPaste is null)
+                    throw new InvalidOperationException("Chart source has no preceding verified paste in this replay.");
+                var handle = FindDesktopWindow(step.Target.Process, step.Target.Window);
+                TableReplayAdapters.Require(handle, TableCapability.ChartSource)
+                    .SetChartSource(handle, chartName, lastVerifiedPaste);
+                status($"Completed step {step.Number}: verified {chartName} uses all {lastVerifiedPaste.Values.GetLength(0)} category/value rows pasted at '{lastVerifiedPaste.Sheet}'!{lastVerifiedPaste.Destination}.");
+                continue;
+            }
+            if (step is { Action: "extend-formula-to-adjacent-data-end", Target: { Process: { Length: > 0 } },
+                Value: { } formulaColumn, ExpectedState: { } adjacentState })
+            {
+                var adjacent = Regex.Match(adjacentState, @"^adjacent-column:([A-Z]{1,3})$");
+                if (!adjacent.Success || !Regex.IsMatch(formulaColumn, @"^[A-Z]{1,3}$"))
+                    throw new InvalidDataException("Formula extension has no valid column scope.");
+                var handle = FindDesktopWindow(step.Target.Process, step.Target.Window);
+                var adapter = TableReplayAdapters.Require(handle, TableCapability.FormulaExtension);
+                int? sourceRow = null;
+                if (step.TargetStrategy?.StartsWith("formula-source:", StringComparison.Ordinal) == true)
+                {
+                    var source = Regex.Match(step.TargetStrategy, @"^formula-source:([A-Z]{1,3})([1-9]\d*)$");
+                    if (!source.Success || source.Groups[1].Value != formulaColumn ||
+                        !int.TryParse(source.Groups[2].Value, out var row))
+                        throw new InvalidDataException("Formula extension has an invalid explicit source.");
+                    sourceRow = row;
+                }
+                else if (step.TargetStrategy is not (null or "last-populated-formula"))
+                    throw new InvalidDataException("Formula extension has an unsupported source strategy.");
+                var range = await adapter.ExtendFormulaAsync(handle, step.Target, formulaColumn,
+                    adjacent.Groups[1].Value, token, sourceRow);
+                status($"Completed step {step.Number}: extended and verified formulas in {range}; existing formulas above it were unchanged.");
+                continue;
+            }
+            if (step.Action == "key" && step.Key is "Control+C" or "Ctrl+C")
+                copiedExcelValues = null;
+            if (step is { Action: "click", Target: { Process: "EXCEL",
+                AutomationId: "PasteMenu_Dropdown" } pasteMenu } &&
+                index + 1 < plan.Steps.Count && plan.Steps[index + 1] is
+                    { Action: "click", Target: { Process: "EXCEL", Name: "Values",
+                        ParentName: "Paste Values" } valuesTarget } &&
+                valuesTarget.Window == pasteMenu.Window)
+            {
+                var destination = FindPasteDestination(plan.Steps, index);
+                if (copiedExcelValues is null ||
+                    destination is not { Process: "EXCEL",
+                        ControlType: "ControlType.DataItem", AutomationId: { Length: > 0 } address } ||
+                    destination.Window != pasteMenu.Window ||
+                    !Regex.IsMatch(address, @"^[A-Z]{1,3}[1-9]\d*$", RegexOptions.IgnoreCase))
+                    throw new InvalidOperationException($"Step {step.Number}: Paste Values has no verified copy snapshot and destination.");
+                var handle = FindDesktopWindow("EXCEL", pasteMenu.Window);
+                if (handle == 0) throw new InvalidOperationException("Workbook unavailable for Paste Values.");
+                if (GetAncestor(GetForegroundWindow(), 2) != GetAncestor(handle, 2))
+                    throw new InvalidOperationException("Workbook lost focus before Paste Values; nothing was pasted.");
+                TableReplayAdapters.Require(handle, TableCapability.PasteValues)
+                    .PasteValues(handle, address, copiedExcelValues);
+                lastVerifiedPaste = new TablePaste(ExcelNativeSheet.Read<string>(handle, sheet => (string)sheet.Name),
+                    address, copiedExcelValues);
+                status($"Completed steps {step.Number}-{plan.Steps[index + 1].Number}: executed Excel Paste Values at {address} and verified all {copiedExcelValues.Length} values without formulas.");
+                index++;
+                continue;
+            }
+            if (step is { Action: "click", Target: { Process: "EXCEL", Window: "Move or Copy" } copyDialogTarget } &&
+                copiedSheetTarget is not null && tabsBeforeCopy is not null)
+            {
+                var timer = Stopwatch.StartNew();
+                var dialogHandle = FindDesktopWindow("EXCEL", "Move or Copy", exactOnly: true);
+                if (dialogHandle == 0)
+                    throw new InvalidOperationException($"Step {step.Number}: the copy dialog disappeared before '{copyDialogTarget.Name}'.");
+                var dialog = AutomationElement.FromHandle(dialogHandle);
+                var controls = dialog.FindAll(TreeScope.Descendants, new AndCondition(
+                    new PropertyCondition(AutomationElement.NameProperty, copyDialogTarget.Name),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty,
+                        copyDialogTarget.Name == "Create a copy" ? ControlType.CheckBox :
+                        copyDialogTarget.Name == "OK" ? ControlType.Button : ControlType.ListItem)));
+                if (controls.Count != 1 || !controls[0].Current.IsEnabled)
+                    throw new InvalidOperationException($"Step {step.Number}: copy dialog does not expose one enabled '{copyDialogTarget.Name}' control.");
+                status($"Finding step {step.Number}: {copyDialogTarget.Name} in the active copy dialog");
+                if (copyDialogTarget.Name == "Create a copy")
+                {
+                    var toggle = (TogglePattern)controls[0].GetCurrentPattern(TogglePattern.Pattern);
+                    if (toggle.Current.ToggleState != ToggleState.On) toggle.Toggle();
+                    if (toggle.Current.ToggleState != ToggleState.On)
+                        throw new InvalidOperationException("Create a copy did not become checked; no sheet was moved.");
+                }
+                else
+                {
+                    Act(controls[0], step);
+                    if (copyDialogTarget.ControlType == "ControlType.ListItem" &&
+                        !((SelectionItemPattern)controls[0].GetCurrentPattern(SelectionItemPattern.Pattern)).Current.IsSelected)
+                        throw new InvalidOperationException("The copy destination sheet was not selected.");
+                }
+                if (copyDialogTarget.Name == "OK")
+                {
+                    var created = await WaitForNewTabAsync(copiedSheetTarget, tabsBeforeCopy, token);
+                    var recorded = plan.Steps.Skip(index + 1)
+                        .FirstOrDefault(candidate => candidate.Target is not null && IsExcelSheetTab(candidate.Target))?.Target?.Name;
+                    if (recorded is not null && !recorded.Equals(created, StringComparison.OrdinalIgnoreCase))
+                        plan = plan with { Steps = plan.Steps.Select((candidate, position) =>
+                            position > index && candidate.Target is not null && IsExcelSheetTab(candidate.Target) &&
+                            candidate.Target.Name == recorded
+                                ? candidate with { Target = candidate.Target with { Name = created } } : candidate).ToList() };
+                    copiedSheetTarget = null;
+                    tabsBeforeCopy = null;
+                }
+                status($"Completed step {step.Number}: verified copy-dialog action ({timer.Elapsed.TotalSeconds:F1} seconds).");
+                continue;
+            }
+            if (step is { Action: "copy-column-until-empty" or "copy-populated-columns", Target: { Process: { Length: > 0 } },
+                Value: { } copyStart })
+            {
+                var handle = FindDesktopWindow(step.Target.Process, step.Target.Window);
+                var adapter = TableReplayAdapters.Require(handle, TableCapability.CopyRange);
+                var stopValues = step.ExpectedState?.StartsWith("copy-stop-values:", StringComparison.Ordinal) == true
+                    ? System.Text.Json.JsonSerializer.Deserialize<string[]>(step.ExpectedState["copy-stop-values:".Length..])
+                        ?? throw new InvalidDataException("Copy stop values are missing.")
+                    : Array.Empty<string>();
+                var copied = step.Action == "copy-populated-columns"
+                    ? await adapter.CopyPopulatedColumnsAsync(handle, step.Target, copyStart, token)
+                    : await adapter.CopyUntilEmptyAsync(handle, step.Target, copyStart, stopValues, token);
+                copiedExcelValues = copied.Values;
+                status($"Completed step {step.Number}: selected and copied {copied.Range}, stopping before {(step.Action == "copy-populated-columns" ? "the first row with an empty selected-column cell" : "the first empty cell")}{(stopValues.Length == 0 ? "" : " or " + string.Join(", ", stopValues))}.");
+                continue;
+            }
+            if (step is { Action: "duplicate-range-values-and-formulas", Target: { Process: "EXCEL" },
+                Value: { } sourceRange, ExpectedState: { } destinationState } &&
+                destinationState.StartsWith("destination-range:", StringComparison.Ordinal))
+            {
+                var handle = FindDesktopWindow("EXCEL", step.Target.Window);
+                if (handle == 0) throw new InvalidOperationException("Workbook unavailable for the recorded row copy.");
+                var recordedDestinationRange = destinationState["destination-range:".Length..];
+                if (step.TargetStrategy == "last-populated-row-in-first-column")
+                {
+                    // "Previous row" is relative to the workbook at replay time. Carry the
+                    // resolved addresses into the following date update so it cannot fall
+                    // back to stale coordinates captured during recording.
+                    lastDynamicDuplicatedRow = ExcelNativeSheet.Read<ExcelNativeSheet.DuplicatedRow>(handle,
+                        sheet => ExcelNativeSheet.CopyLastPopulatedRow(sheet, sourceRange));
+                    status($"Completed step {step.Number}: copied live last row {lastDynamicDuplicatedRow.SourceRange} into {lastDynamicDuplicatedRow.DestinationRange} and verified the row.");
+                }
+                else
+                {
+                    ExcelNativeSheet.Read<bool>(handle, sheet =>
+                    {
+                        ExcelNativeSheet.CopyRange(sheet, sourceRange, recordedDestinationRange);
+                        return true;
+                    });
+                    lastDynamicDuplicatedRow = null;
+                    status($"Completed step {step.Number}: copied {sourceRange} into {recordedDestinationRange} and verified the row.");
+                }
+                continue;
+            }
+            if (step is { Action: "update-cell-to-relative-weekday", Target: { Process: "EXCEL" } dateTarget,
+                RelativeWeekday: { } weekday, Value: { } sourceDateCell,
+                ExpectedState: { } destinationRangeState } &&
+                destinationRangeState.StartsWith("destination-range:", StringComparison.Ordinal))
+            {
+                var handle = FindDesktopWindow("EXCEL", dateTarget.Window);
+                if (handle == 0) throw new InvalidOperationException("Workbook unavailable for the copied-row date update.");
+                var address = dateTarget.AutomationId ?? dateTarget.Name
+                    ?? throw new InvalidDataException("Copied-row date target is missing.");
+                var destinationRange = destinationRangeState["destination-range:".Length..];
+                if (step.TargetStrategy == "copied-live-last-row-date-and-formulas")
+                {
+                    var live = lastDynamicDuplicatedRow ?? throw new InvalidOperationException(
+                        $"Step {step.Number}: the live previous-row copy was not completed; the date update was not attempted.");
+                    sourceDateCell = live.SourceDateCell;
+                    address = live.DestinationDateCell;
+                    destinationRange = live.DestinationRange;
+                }
+                var resolved = ExcelNativeSheet.Read<string>(handle, sheet =>
+                    ExcelNativeSheet.UpdateCopiedRowToRelativeWeekday(sheet, sourceDateCell,
+                        address, destinationRange, weekday, DateTime.Today));
+                status($"Completed step {step.Number}: updated {destinationRange} to {resolved} using next {weekday}, including copied formula references.");
+                lastDynamicDuplicatedRow = null;
+                continue;
+            }
+            if (step is { Action: "click", Target: { Process: "EXCEL",
+                ControlType: "ControlType.DataItem" } cellTarget } &&
+                Regex.IsMatch(!string.IsNullOrWhiteSpace(cellTarget.AutomationId)
+                    ? cellTarget.AutomationId : cellTarget.Name ?? "",
+                    @"^[A-Z]{1,3}[1-9]\d*$", RegexOptions.IgnoreCase))
+            {
+                var address = !string.IsNullOrWhiteSpace(cellTarget.AutomationId)
+                    ? cellTarget.AutomationId : cellTarget.Name!;
+                var handle = FindDesktopWindow("EXCEL", cellTarget.Window);
+                if (handle == 0) throw new InvalidOperationException("Workbook unavailable for cell navigation.");
+                if (index + 1 < plan.Steps.Count && plan.Steps[index + 1] is
+                    { Action: "key", Key: "Delete", Target: { Process: "EXCEL" } cellDeleteTarget } &&
+                    cellDeleteTarget.Window == cellTarget.Window &&
+                    (cellDeleteTarget.AutomationId == address || cellDeleteTarget.Name == address))
+                {
+                    // Native selection already verifies the workbook and active sheet. Clear the
+                    // same recorded cell through that native object instead of asking UIA to find
+                    // it again after focus and accessibility trees have changed.
+                    ExcelNativeSheet.Read<bool>(handle, sheet =>
+                    {
+                        ExcelNativeSheet.SelectRange(sheet, address);
+                        ExcelNativeSheet.ClearCellContents(sheet, address);
+                        return true;
+                    });
+                    status($"Completed steps {step.Number}-{plan.Steps[index + 1].Number}: selected and cleared {address} through Excel and verified it is empty.");
+                    index++;
+                    continue;
+                }
+                ActivateWindow(AutomationElement.FromHandle(handle));
+                ExcelNativeSheet.Read<bool>(handle, sheet =>
+                {
+                    ExcelNativeSheet.SelectRange(sheet, address);
+                    return true;
+                });
+                await Task.Delay(100, token);
+                status($"Completed step {step.Number}: navigated directly to and verified {address}.");
+                continue;
+            }
+            if (step is { Action: "click", Target: { Process: "EXCEL",
+                Name: "Values", ParentName: "Paste Values" } pasteTarget })
+            {
+                var handle = FindDesktopWindow("EXCEL", pasteTarget.Window);
+                if (handle == 0) throw new InvalidOperationException("Workbook unavailable for Paste Values.");
+                ExcelNativeSheet.Read<bool>(handle, sheet =>
+                {
+                    ExcelNativeSheet.VerifyCopyMode(sheet);
+                    return true;
+                });
+            }
+            if (step is { Action: "key", Key: "Control+C" or "Ctrl+C",
+                Target: { Process: "EXCEL" } copyPane } &&
+                (copyPane.ClassName == "XLDESK" ||
+                 step.ExpectedState?.StartsWith("excel-selection-range:", StringComparison.Ordinal) == true))
+            {
+                if (step.ExpectedState?.StartsWith("excel-selection-range:", StringComparison.Ordinal) == true)
+                {
+                    var range = step.ExpectedState["excel-selection-range:".Length..];
+                    if (!Regex.IsMatch(range, @"^[A-Z]{1,3}[1-9]\d*(?::[A-Z]{1,3}[1-9]\d*)?$"))
+                        throw new InvalidDataException("Recorded Excel copy range is invalid.");
+                    var workbook = FindDesktopWindow("EXCEL", copyPane.Window);
+                    if (workbook == 0) throw new InvalidOperationException("Workbook unavailable for recorded range copy.");
+                    ActivateWindow(AutomationElement.FromHandle(workbook));
+                    await GoToExcelAddressAsync(range, token);
+                    ExcelNativeSheet.Read<bool>(workbook, sheet =>
+                    {
+                        ExcelNativeSheet.VerifyRangeSelection(sheet, range);
+                        return true;
+                    });
+                }
+                if (!HasVerifiedExcelCellFocus(copyPane))
+                    throw new InvalidOperationException($"Step {step.Number}: worksheet selection is not verified; Ctrl+C was not sent.");
+                var handle = FindDesktopWindow("EXCEL", copyPane.Window);
+                copiedExcelValues = ExcelNativeSheet.Read<object?[,]>(handle,
+                    sheet => ExcelNativeSheet.CaptureSelectionValues(sheet));
+                SendKeys.SendWait("^c");
+                await Task.Delay(150, token);
+                ExcelNativeSheet.Read<bool>(handle, sheet =>
+                {
+                    ExcelNativeSheet.VerifyCopyMode(sheet);
+                    return true;
+                });
+                status($"Completed step {step.Number}: copied the verified worksheet selection.");
+                continue;
+            }
+            if (step.Target is { } sheetReference && IsExcelSheetTab(sheetReference) &&
+                await Task.Run(() => Automation.Resolve(sheetReference), token) is null)
+            {
+                var aliases = renamedSheetReferences.Where(rename =>
+                    rename.Window == sheetReference.Window &&
+                    IsDatedSheetReference(rename.Template, sheetReference.Name)).ToList();
+                if (aliases.Count == 1)
+                {
+                    var workbookHandle = FindDesktopWindow("EXCEL", sheetReference.Window);
+                    if (workbookHandle == 0)
+                        throw new InvalidOperationException("Workbook unavailable for dated-sheet reference verification.");
+                    if (!ExcelNativeSheet.Read<bool>(workbookHandle, sheet =>
+                        ExcelNativeSheet.HasSheet(sheet, sheetReference.Name!)))
+                    {
+                        step = step with { Target = sheetReference with { Name = aliases[0].Name } };
+                        status($"Step {step.Number}: following the sheet renamed by this replay: {aliases[0].Name}, instead of missing recorded date '{sheetReference.Name}'.");
+                    }
+                }
+            }
+            if (step is { Action: "click", Target: { Process: "EXCEL",
+                    ClassName: "XLGridColumnHeader", Name: { Length: > 0 } clearColumn } } &&
+                Regex.IsMatch(clearColumn, @"\A[A-Z]{1,3}\z", RegexOptions.IgnoreCase) &&
+                index + 1 < plan.Steps.Count &&
+                plan.Steps[index + 1] is { Action: "key", Key: "Delete", Target: { } deleteTarget } &&
+                deleteTarget.Process == step.Target.Process && deleteTarget.Window == step.Target.Window)
+            {
+                var handle = FindDesktopWindow("EXCEL", step.Target.Window);
+                if (handle == 0) throw new InvalidOperationException("Workbook unavailable for clearing the selected column.");
+                ActivateWindow(AutomationElement.FromHandle(handle));
+                if (GetAncestor(GetForegroundWindow(), 2) != GetAncestor(handle, 2))
+                    throw new InvalidOperationException("Workbook did not take focus for column selection.");
+                ExcelNativeSheet.Read<bool>(handle, sheet =>
+                {
+                    ExcelNativeSheet.ClearColumnContents(sheet, clearColumn.ToUpperInvariant());
+                    return true;
+                });
+                status($"Completed steps {step.Number}-{plan.Steps[index + 1].Number}: cleared column {clearColumn} contents through Excel and verified it is empty; formatting and cells were preserved.");
+                index++;
+                continue;
+            }
+            if (index + 1 < plan.Steps.Count &&
+                PlanCompactor.IsSupersededExcelCellClick(step, plan.Steps[index + 1]))
+            {
+                status($"Skipped step {step.Number}: the following text entry independently selects and verifies Excel cell {plan.Steps[index + 1].Target?.AutomationId}; the coarse grid click is not needed.");
+                continue;
+            }
+            if (pendingOptionalStep is not null &&
+                await TryPerformDelayedOptionalStepAsync(pendingOptionalStep, token, 1))
+            {
+                status($"Completed delayed optional step {pendingOptionalStep.Number}: {pendingOptionalStep.Target?.Name} appeared after its initial wait.");
+                pendingOptionalStep = null;
+                priorConditionalControlWasAbsent = false;
+                if (step.Action == "click-if-previous-absent")
+                {
+                    status($"Skipped conditional step {step.Number}: the delayed optional control appeared.");
+                    await WaitForOptionalOutcomeAsync(plan.Steps, index, status, token);
+                    continue;
+                }
+            }
+            if (step.Action == "click-if-previous-absent")
+            {
+                if (pendingOptionalStep is not null &&
+                    await TryPerformDelayedOptionalStepAsync(pendingOptionalStep, token, 150))
+                {
+                    status($"Completed delayed optional step {pendingOptionalStep.Number}: {pendingOptionalStep.Target?.Name} appeared before the fallback action.");
+                    pendingOptionalStep = null;
+                    priorConditionalControlWasAbsent = false;
+                }
+                if (!priorConditionalControlWasAbsent)
+                {
+                    status($"Skipped conditional step {step.Number}: the preceding optional control appeared.");
+                    await WaitForOptionalOutcomeAsync(plan.Steps, index, status, token);
+                    continue;
+                }
+                step = step with { Action = "click" };
+                if (step.TargetStrategy == "unique-refresh-command")
+                {
+                    var nextContext = plan.Steps.Skip(index + 1)
+                        .FirstOrDefault(candidate => candidate.Target?.Process == step.Target?.Process &&
+                            candidate.Target?.Window == step.Target?.Window)?.Target;
+                    var refreshCommand = await Task.Run(() => Automation.ResolveUniqueRefreshCommand(step.Target!, nextContext), token);
+                    var identity = refreshCommand is null ? null : Automation.Describe(refreshCommand);
+                    if (identity is null)
+                        throw new InvalidOperationException($"Step {step.Number}: explicit refresh fallback has no unique enabled Refresh button in '{step.Target?.Window}'. No command was guessed.");
+                    step = step with { Target = identity };
+                    status($"Running explicit absent-dialog fallback: {identity.Name}");
+                }
+                priorConditionalControlWasAbsent = false;
+            }
+            if (step.Action == "fill-down-to-adjacent-data-end" && index > 0 &&
+                plan.Steps[index - 1] is { Action: "type", Value: not null, Target:
+                    { AutomationId: { Length: > 0 } sourceAddress } sourceTarget } sourceStep)
+            {
+                var liveSource = liveFilteredSources.GetValueOrDefault(index - 1);
+                var filledThrough = liveSource is not null
+                    ? await FillVisibleExcelRowsAsync(step, liveSource, sourceStep.Value!, token)
+                    : await FillExcelDownToAdjacentDataEndAsync(step, sourceTarget, sourceAddress, sourceStep.Value!, token);
+                status($"Completed step {step.Number}: filled {liveSource?.AutomationId ?? sourceAddress} down through {filledThrough} using the adjacent data.");
+                continue;
+            }
             if (step.Action == "open-browser-process")
             {
                 freshBrowserProcessId = await LaunchFreshBrowserAsync(step.Target?.BrowserLaunch,
@@ -168,11 +681,12 @@ internal static class Executor
                 status($"Completed step {step.Number}: opened an Edge window with the default profile.");
                 continue;
             }
-            if (step.Action == "click" && step.Target is
-                { Process: "EXCEL", Name: "OK", ControlType: "ControlType.Button" } &&
-                index > 0 && plan.Steps[index - 1].Action == "replace-all" &&
-                plan.Steps[index - 1].Target?.Process?.Equals("EXCEL",
-                    StringComparison.OrdinalIgnoreCase) == true)
+            var acknowledgementPredecessor = index - 1;
+            if (acknowledgementPredecessor >= 0 && plan.Steps[acknowledgementPredecessor] is
+                { Action: "close-window", Target: { Process: "EXCEL", Window: "Find and Replace" } })
+                acknowledgementPredecessor--;
+            if (acknowledgementPredecessor >= 0 &&
+                PlanCompactor.IsReplacementAcknowledgement(step, plan.Steps[acknowledgementPredecessor]))
             {
                 status($"Skipped step {step.Number}: the preceding Replace All step already verified and dismissed Excel's result dialog.");
                 continue;
@@ -241,6 +755,15 @@ internal static class Executor
                 !Environment.UserName.Equals(step.WhenUser.Split('\\').Last(), StringComparison.OrdinalIgnoreCase))
             {
                 status($"Skipped step {step.Number}: this replacement applies to {step.WhenUser}.");
+                continue;
+            }
+            if (step.Action == "filter-values")
+            {
+                await ApplyExcelFilterAsync(step, token);
+                if (step.ExpectedState == "filter:all") filteredWorkbooks.Remove(step.Target!.Window!);
+                else filteredWorkbooks.Add(step.Target!.Window!);
+                status($"Completed step {step.Number}: verified filter {step.Target?.ParentName}, " +
+                    $"{step.ExpectedState}; {string.Join(", ", ExcelFilterPlan.Values(step))}. The filter popup closed.");
                 continue;
             }
             if (step.Target is { ControlType: "ControlType.DataItem" } recordedCell)
@@ -611,10 +1134,29 @@ internal static class Executor
                     throw new InvalidOperationException($"Step {step.Number}: Windows Search is empty after the recorded paste; Enter was not sent.");
                 var windowsBeforeLaunch = VisibleApplicationWindows();
                 await Task.Delay(900, token); // Let Search update its selected result after text entry.
-                SendKeys.SendWait("{ENTER}");
-                status($"Step {step.Number}: pressed Enter in Windows Search; if Windows requests elevation, approve it yourself while replay waits for the application.");
+                var query = searchBox is not null && searchBox.TryGetCurrentPattern(
+                    ValuePattern.Pattern, out var liveSearchValue)
+                    ? ((ValuePattern)liveSearchValue).Current.Value : step.Target.Name;
+                var invokedExactResult = false;
+                if (!string.IsNullOrWhiteSpace(query))
+                    for (var attempt = 0; attempt < 8 && !invokedExactResult; attempt++)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        invokedExactResult = TryInvokeUniqueExactWindowsSearchResult(query!, out _);
+                        if (!invokedExactResult) await Task.Delay(100, token);
+                    }
+                if (invokedExactResult)
+                    status($"Step {step.Number}: invoked the unique Windows Search result matching '{query}'. If Windows requests elevation, approve it yourself while replay waits for the application.");
+                else
+                {
+                    // Enter remains valid for searches whose result label differs from the query.
+                    // Prefer the exact visible result when available so focus changes cannot submit
+                    // a web suggestion or leave Search open without launching the recorded app.
+                    SendKeys.SendWait("{ENTER}");
+                    status($"Step {step.Number}: RSR submitted Windows Search automatically. If Windows requests elevation, approve only the UAC prompt while replay waits for the application.");
+                }
                 await Task.Delay(1200, token);
-                if (WindowsSearchStillActive(searchBoxTarget))
+                if (!invokedExactResult && WindowsSearchStillActive(searchBoxTarget))
                 {
                     SendKeys.SendWait("{ENTER}");
                     status($"Step {step.Number}: Windows Search still showed the results; retried Enter once.");
@@ -626,7 +1168,10 @@ internal static class Executor
                 var launchedWindow = expectedApplication is null ? null :
                     await WaitForRecordedApplicationWindowAsync(expectedApplication.Process!,
                         expectedApplication.Window, token);
-                launchedWindow ??= await WaitForNewApplicationWindowAsync(windowsBeforeLaunch, token);
+                // When later steps identify the expected application, an unrelated window opening
+                // at the same time (for example Settings) must never satisfy the Search launch.
+                if (expectedApplication is null)
+                    launchedWindow ??= await WaitForNewApplicationWindowAsync(windowsBeforeLaunch, token);
                 if (launchedWindow is null)
                 {
                     var searchState = WindowsSearchStillActive(searchBoxTarget)
@@ -640,7 +1185,8 @@ internal static class Executor
                     launchedWindow = expectedApplication is null ? null :
                         await WaitForRecordedApplicationWindowAsync(expectedApplication.Process!,
                             expectedApplication.Window, token);
-                    launchedWindow ??= await WaitForNewApplicationWindowAsync(windowsBeforeLaunch, token);
+                    if (expectedApplication is null)
+                        launchedWindow ??= await WaitForNewApplicationWindowAsync(windowsBeforeLaunch, token);
                     if (launchedWindow is null)
                         throw new InvalidOperationException($"Step {step.Number}: Search closed, but no new application window was observed after manual handling.");
                 }
@@ -704,7 +1250,7 @@ internal static class Executor
             }
             if (step.Action == "replace-all")
             {
-                var result = await ApplyRecordedReplacementAsync(step, token);
+                var result = await ApplyRecordedReplacementAsync(step, token, handleUnexpectedDialog);
                 replacementDialogOpen = true;
                 status($"Completed step {step.Number}: {result}");
                 continue;
@@ -743,7 +1289,45 @@ internal static class Executor
                 copiedSheetTarget = null;
                 tabsBeforeCopy = null;
             }
+            if (plan.Steps[index].Action != "click-if-previous-absent" &&
+                IsConditionalStep(step) && index + 1 < plan.Steps.Count)
+            {
+                status($"Waiting up to 20 seconds for optional step {step.Number}: {step.Target!.Name}");
+                if (await WaitForOptionalStepAsync(step, token, TimeSpan.FromSeconds(20)))
+                {
+                    priorConditionalControlWasAbsent = false;
+                    pendingOptionalStep = null;
+                    previousProcess = step.Target.Process;
+                    previousWindow = step.Target.Window;
+                    status($"Completed optional step {step.Number}: {step.Target.Name}");
+                    continue;
+                }
+                var fallbackRecorded = plan.Steps[index + 1].Action == "click-if-previous-absent";
+                var nextTarget = plan.Steps[index + 1].Target;
+                var nextControlReady = !fallbackRecorded &&
+                    await OptionalNextControlReadyAsync(nextTarget, token);
+                // Recheck after probing readiness: the dialog may have appeared during UIA lookup.
+                if (await TryPerformDelayedOptionalStepAsync(step, token, 1))
+                {
+                    priorConditionalControlWasAbsent = false;
+                    pendingOptionalStep = null;
+                    status($"Completed optional step {step.Number}: {step.Target.Name}");
+                    continue;
+                }
+                if (!fallbackRecorded && !nextControlReady && !IsRecordedOccasionalDialog(step))
+                    throw new InvalidOperationException($"Step {step.Number}: optional control '{step.Target.Name}' " +
+                        "did not appear within 20 seconds, and the next recorded control is not ready. " +
+                        "Replay stopped rather than assuming the dialog could be skipped.");
+                priorConditionalControlWasAbsent = true;
+                pendingOptionalStep = step;
+                status(fallbackRecorded
+                    ? $"Optional step {step.Number} did not appear within 20 seconds; continuing with its recorded fallback."
+                    : $"Skipped optional step {step.Number}: '{step.Target.Name}' did not appear within 20 seconds, " +
+                        $"and the next recorded control '{nextTarget!.Name}' is ready.");
+                continue;
+            }
             PauseForUnexpectedDialog(step.Target.Process, knownWindows, handleUnexpectedDialog, status, token);
+            AutomationElement? transitionResolvedElement = null;
             var preservePageFocus = step.Action is "type" or "key" &&
                 step.Target.ControlType == "ControlType.Pane" &&
                 string.IsNullOrWhiteSpace(step.Target.Name) &&
@@ -759,6 +1343,13 @@ internal static class Executor
                 (!step.Target.Process.Equals(previousProcess, StringComparison.OrdinalIgnoreCase) ||
                  !string.Equals(step.Target.Window, previousWindow, StringComparison.OrdinalIgnoreCase)))
             {
+                // Wizard pages often change their window title while keeping the same usable window.
+                // Resolve the next control first so a title change does not force a maximize and a
+                // five-second exact-window search before every step. Window recovery remains the
+                // fallback when the control is not immediately available. Browser identity still
+                // uses its dedicated window checks so replay cannot drift into another profile.
+                if (step.Target.BrowserLaunch is null)
+                    transitionResolvedElement = await FindAsync(step.Target, token, 1);
                 if (tuckedAwayDialog != 0 &&
                     string.Equals(step.Target.Window, GetNativeWindowTitle(tuckedAwayDialog), StringComparison.OrdinalIgnoreCase))
                 {
@@ -777,12 +1368,15 @@ internal static class Executor
                         status($"Temporarily moved {previousWindow} out of the way for the next window's control.");
                     }
                 }
-                await EnsureApplicationWindowAsync(step.Target.Process, step.Target.Window, status, token,
-                    step.Target.BrowserLaunch, step.Target, approveBrowserChange,
-                    approvedBrowserWindows, freshBrowserProcessId,
-                    processId => freshBrowserProcessId = processId,
-                    selectedBrowserProcessId,
-                    processId => selectedBrowserProcessId = processId);
+                if (transitionResolvedElement is null)
+                    await EnsureApplicationWindowAsync(step.Target.Process, step.Target.Window, status, token,
+                        step.Target.BrowserLaunch, step.Target, approveBrowserChange,
+                        approvedBrowserWindows, freshBrowserProcessId,
+                        processId => freshBrowserProcessId = processId,
+                        selectedBrowserProcessId,
+                        processId => selectedBrowserProcessId = processId);
+                else
+                    ActivateWindow(transitionResolvedElement);
                 previousProcess = step.Target.Process;
                 previousWindow = step.Target.Window;
             }
@@ -802,6 +1396,40 @@ internal static class Executor
                 if (!IsZoomed(browserWindow))
                     throw new InvalidOperationException($"Step {step.Number}: Edge did not become maximized.");
                 status($"Completed step {step.Number}: verified the recorded Edge window is maximized.");
+                continue;
+            }
+            if (step.Action == "click" && step.Target.BrowserLaunch is not null &&
+                step.Target.ControlType == "ControlType.Button" &&
+                (step.Target.ClassName == "EdgeNewTabButton" ||
+                 step.ExpectedState?.Contains("new browser tab", StringComparison.OrdinalIgnoreCase) == true) &&
+                index + 1 < plan.Steps.Count && plan.Steps[index + 1].Target is { } newTabNextTarget &&
+                string.Equals(newTabNextTarget.Process, step.Target.Process, StringComparison.OrdinalIgnoreCase))
+            {
+                // Edge has changed the UIA identity and capitalization of its New Tab toolbar button
+                // across releases. Ctrl+T expresses the recorded browser command without depending on
+                // that transient node. Verify the following recorded control before continuing so the
+                // shortcut cannot silently land in the wrong browser context.
+                if (!ForegroundProcessMatches(step.Target.Process))
+                    await EnsureApplicationWindowAsync(step.Target.Process!, step.Target.Window, status, token,
+                        step.Target.BrowserLaunch, step.Target, approveBrowserChange,
+                        approvedBrowserWindows, freshBrowserProcessId,
+                        processId => freshBrowserProcessId = processId,
+                        selectedBrowserProcessId,
+                        processId => selectedBrowserProcessId = processId);
+                SendKeys.SendWait("^t");
+                AutomationElement? nextControl = null;
+                for (var attempt = 0; attempt < 30 && nextControl is null; attempt++)
+                {
+                    token.ThrowIfCancellationRequested();
+                    nextControl = await FindAsync(newTabNextTarget, token, 1);
+                    if (nextControl is null) await Task.Delay(100, token);
+                }
+                if (nextControl is null)
+                    throw new InvalidOperationException($"Step {step.Number}: Edge received the recorded New Tab command, " +
+                        $"but the following control '{newTabNextTarget.Name}' did not appear in the recorded browser window.");
+                status($"Completed step {step.Number}: opened a new browser tab and verified '{newTabNextTarget.Name}'.");
+                previousProcess = newTabNextTarget.Process;
+                previousWindow = newTabNextTarget.Window;
                 continue;
             }
             if (step.Action == "click" &&
@@ -918,13 +1546,41 @@ internal static class Executor
                     : $"Completed step {step.Number}: selected all in the verified Excel workbook.");
                 continue;
             }
-            if (step.Action == "click" && step.Target.ControlType == "ControlType.Table" &&
-                string.IsNullOrWhiteSpace(step.ExpectedState) && index + 1 < plan.Steps.Count &&
-                plan.Steps[index + 1].Action == "click" &&
-                plan.Steps[index + 1].Target?.Process == step.Target.Process &&
-                plan.Steps[index + 1].Target?.ControlType is "ControlType.Button" or "ControlType.MenuItem")
+            if (PlanCompactor.IsTitleFocusBeforeCommand(step,
+                index + 1 < plan.Steps.Count ? plan.Steps[index + 1] : null))
             {
-                status($"Skipped step {step.Number}: the table click only focused the view before the next menu action.");
+                status($"Skipped step {step.Number}: title-bar navigation to '{step.Target!.Window}'; " +
+                    "the next command activates its own window.");
+                continue;
+            }
+            if (IsWindowActivationClick(step))
+            {
+                status($"Activating the recorded window for step {step.Number}: {step.Target!.Window}");
+                await EnsureApplicationWindowAsync(step.Target.Process!, step.Target.Window, status, token);
+                previousProcess = step.Target.Process;
+                previousWindow = step.Target.Window;
+                status($"Completed step {step.Number}: verified and activated '{step.Target.Window}'.");
+                continue;
+            }
+            if (PlanCompactor.IsStatusBackgroundBeforeNavigation(step,
+                index + 1 < plan.Steps.Count ? plan.Steps[index + 1] : null))
+            {
+                status($"Skipped step {step.Number}: status-bar background navigation; the next worksheet tab activates its own target.");
+                continue;
+            }
+            if (IsStaticLabelNavigation(step,
+                index + 1 < plan.Steps.Count ? plan.Steps[index + 1] : null))
+            {
+                status($"Skipped step {step.Number}: '{step.Target!.Name}' is a static status label, not an actionable command.");
+                continue;
+            }
+            var nextGridCommand = index + 1 < plan.Steps.Count ? plan.Steps[index + 1] : null;
+            if (nextGridCommand?.Action == "optional-click" && index + 2 < plan.Steps.Count &&
+                plan.Steps[index + 2].Action == "click-if-previous-absent")
+                nextGridCommand = plan.Steps[index + 2];
+            if (IsGridFocusBeforeCommand(step, nextGridCommand))
+            {
+                status($"Skipped step {step.Number}: the grid-background click only focused the view before the next command, which activates its own target.");
                 continue;
             }
             // An owner-drawn dialog can report the control from the previous wizard
@@ -1018,8 +1674,28 @@ internal static class Executor
             {
                 status($"Finding scroll control at step {step.Number}");
                 var scrollTarget = await FindAsync(step.Target, token, 4);
-                if (scrollTarget is null && step.Target.ControlType != "ControlType.ScrollBar" && step.Key is "Vertical" or "Horizontal")
+                if (scrollTarget is null && step.Key is "Vertical" or "Horizontal")
                     scrollTarget = await Task.Run(() => Automation.FindScrollBar(step.Target, step.Key!), token);
+                if (scrollTarget is null && step.Key is "Vertical" or "Horizontal")
+                {
+                    // Chromium pages do not consistently publish their visual scrollbar as a
+                    // ScrollBar element. The foreground page's ScrollPattern is the same semantic
+                    // target and avoids relying on browser-specific pixels or control names.
+                    scrollTarget = await Task.Run(() => FindForegroundScrollableContainer(
+                        step.Target.Process, step.Key!), token);
+                }
+                if (scrollTarget is null && step.Key == "Vertical" &&
+                    int.TryParse(step.Value, out var wheelDelta) &&
+                    TryScrollForegroundDocumentWithWheel(step.Target.Process, wheelDelta,
+                        out var wheelDetail))
+                {
+                    // Some web content exposes a Document but neither its visual scrollbar nor a
+                    // ScrollPattern. Verified wheel input inside that live document preserves the
+                    // recorded gesture without guessing screen coordinates from the recording.
+                    await Task.Delay(150, token);
+                    status($"Completed step {step.Number}: {wheelDetail}");
+                    continue;
+                }
                 if (scrollTarget is null) throw new InvalidOperationException($"Step {step.Number}: scroll control was not found.");
                 ActivateWindow(scrollTarget);
                 ApplyScroll(scrollTarget, step, status);
@@ -1029,6 +1705,9 @@ internal static class Executor
             if (step.Action == "ensure-state" && step.Target.ControlType == "ControlType.HeaderItem" &&
                 DesiredSortDirection(step.ExpectedState) is { } desiredDirection)
             {
+                status($"Waiting for step {step.Number}: {step.Target.Name} in an enabled, populated view");
+                await WaitForReadyControlAsync(step.Target, token, TimeSpan.FromSeconds(120),
+                    failureContext: $"Step {step.Number}: the sort view");
                 var header = await FindAsync(step.Target, token)
                     ?? throw new InvalidOperationException($"Step {step.Number}: sort header was not found.");
                 ActivateWindow(header);
@@ -1109,6 +1788,11 @@ internal static class Executor
                     ?? throw new InvalidOperationException($"Step {step.Number}: sheet tab '{step.Target.Name}' was not found. " +
                         Automation.TabLookupDiagnostics(step.Target));
                 ActivateWindow(sheet);
+                SelectSheet(sheet);
+                await Task.Delay(150, token);
+                sheet = await FindAsync(step.Target, token)
+                    ?? throw new InvalidOperationException($"Step {step.Number}: sheet tab '{step.Target.Name}' " +
+                        "became unavailable after selecting it to reveal the tab.");
                 if (!TryClickLiveUiaElement(sheet, null, rightClick: true, out var detail))
                     throw new InvalidOperationException($"Step {step.Number}: could not verify a right-click on sheet tab '{step.Target.Name}'. {detail}");
                 status($"Completed step {step.Number}: opened the context menu on sheet tab '{step.Target.Name}'.");
@@ -1139,10 +1823,12 @@ internal static class Executor
                 {
                     AutomationId = "A" + excelRowNumber, Name = "A" + excelRowNumber
                 };
-                var firstColumnCell = await FindAsync(firstColumnTarget, token, 3) ??
-                    throw new InvalidOperationException($"Step {step.Number}: could not locate the first cell in row {excelRowNumber} to find its live row header.");
-                ActivateWindow(firstColumnCell);
-                firstColumnCell = await FindAsync(firstColumnTarget, token, 2) ?? firstColumnCell;
+                var rowWorkbook = FindDesktopWindow("EXCEL", step.Target.Window);
+                if (rowWorkbook == 0)
+                    throw new InvalidOperationException($"Step {step.Number}: workbook unavailable for row selection.");
+                ActivateWindow(AutomationElement.FromHandle(rowWorkbook));
+                await GoToExcelAddressAsync("A" + excelRowNumber, token);
+                var firstColumnCell = await WaitForFocusedExcelCellAsync(firstColumnTarget, "A", excelRowNumber, token);
                 var cellBounds = firstColumnCell.Current.BoundingRectangle;
                 if (cellBounds.IsEmpty || cellBounds.Width < 8 || cellBounds.Height < 8)
                     throw new InvalidOperationException($"Step {step.Number}: row {excelRowNumber}'s first cell has no usable live bounds.");
@@ -1227,8 +1913,12 @@ internal static class Executor
                     token.ThrowIfCancellationRequested();
                     var oldNameStillPresent = await Task.Run(() => Automation.Resolve(step.Target) is not null, token);
                     var finalNamePresent = await Task.Run(() => Automation.Resolve(renamed) is not null, token);
-                    if (!oldNameStillPresent && finalNamePresent) break;
                     var selectedName = SelectedSheetName(sheetTabs);
+                    // Excel can update the live tab immediately while the recorded ControlRef
+                    // no longer resolves because its name changed. The selected tab is the
+                    // authoritative result of the rename we just performed.
+                    if (string.Equals(selectedName, intendedName, StringComparison.Ordinal)) break;
+                    if (!oldNameStillPresent && finalNamePresent) break;
                     if (manualHelpAccepted && !oldNameStillPresent &&
                         !string.IsNullOrWhiteSpace(selectedName) && selectedName != nameBeforeManualHelp)
                     {
@@ -1244,10 +1934,30 @@ internal static class Executor
                     manualHelpAccepted = true;
                 }
                 status($"Completed step {step.Number}: renamed sheet to {intendedName}");
+                renamedSheetReferences.Add((step.Target.Window!, renameTemplate, intendedName));
                 if (attachedWeekday is not null) index++; // The following Enter carries the rename intent.
                 continue;
             }
             status($"Finding step {step.Number}: {step.Target.Name ?? step.Target.AutomationId ?? step.Target.ClassName}");
+            if (step.Action == "type" && step.Value is not null && step.Target is
+                { Process: "EXCEL", ControlType: "ControlType.DataItem",
+                  ClassName: "XLSpreadsheetCell", AutomationId: { Length: > 0 } cellAddress })
+            {
+                if (step.TargetStrategy == "first-visible-filtered-row" ||
+                    step.TargetStrategy is null && filteredWorkbooks.Contains(step.Target.Window!) && index + 1 < plan.Steps.Count &&
+                    plan.Steps[index + 1].Action == "fill-down-to-adjacent-data-end")
+                {
+                    status($"Step {step.Number}: going directly to column {ExcelCellAddress(cellAddress).Column}'s header and down to its first visible filtered row.");
+                    var liveSource = await TypeIntoFirstFilteredExcelRowAsync(step, cellAddress,
+                        plan.Steps[index + 1], token);
+                    liveFilteredSources[index] = liveSource;
+                    status($"Completed step {step.Number}: entered '{step.Value}' in first visible filtered cell {liveSource.AutomationId}, not the recorded row {cellAddress}.");
+                    continue;
+                }
+                await TypeIntoExcelCellByAddressAsync(step, cellAddress, token);
+                status($"Completed step {step.Number}: selected and verified Excel cell {cellAddress}, then entered the recorded value.");
+                continue;
+            }
             if (step.Action == "click" && step.Target.Window == "Find and Replace" &&
                 step.Target.Name == "Replace All")
             {
@@ -1279,7 +1989,10 @@ internal static class Executor
                 if (step.Action == "context-selection" && selectedList is null)
                     throw new InvalidOperationException($"Step {step.Number}: the list selection container is unavailable.");
                 if (step.Action == "context-selection" && selectedList is not null && !AllListItemsSelected(selectedList))
-                    throw new InvalidOperationException($"Step {step.Number}: all items are not selected. {ListSelectionDiagnostics(selectedList)}");
+                {
+                    status($"Step {step.Number}: establishing the recorded all-row selection through UI Automation.");
+                    EnsureRecordedAllRowSelection(selectedList, step, token);
+                }
                 ActivateWindow(row);
                 if (selectedList is not null && !AllListItemsSelected(selectedList))
                     SelectAllListItemsViaUia(selectedList, token);
@@ -1418,12 +2131,13 @@ internal static class Executor
                 continue;
             }
             if (step.Action is "type" or "key" &&
-                step.Target.ControlType == "ControlType.Pane" &&
-                string.IsNullOrWhiteSpace(step.Target.Name) &&
-                string.IsNullOrWhiteSpace(step.Target.AutomationId) &&
+                step.Target.ControlType is not ("ControlType.Edit" or "ControlType.ComboBox") &&
                 !string.IsNullOrWhiteSpace(step.Target.Process) &&
                 FollowsSubmittedNavigation(plan.Steps, index))
             {
+                // A page can replace the accessibility node beneath the keyboard before the hook
+                // event is described. After a verified navigation submit, use the live focused page
+                // editor rather than searching for that delayed non-edit node by its stale label.
                 AutomationElement? focused = null;
                 ControlRef? focusedTarget = null;
                 for (var focusAttempt = 0; focusAttempt < 100; focusAttempt++)
@@ -1464,7 +2178,53 @@ internal static class Executor
                     "in the focused application window.");
                 continue;
             }
-            AutomationElement? element = null;
+            AutomationElement? element = transitionResolvedElement;
+            if (element is null && step.Action == "type" &&
+                step.Target is { ControlType: "ControlType.Edit", ClassName: "Edit",
+                    AutomationId: { Length: > 0 } } immediateNativeEdit && step.Value is not null &&
+                TrySetUniqueNativeEdit(immediateNativeEdit, step.Value, out _))
+            {
+                // A blank Win32 Edit often has no usable UIA name. Use its recorded numeric control
+                // id first instead of paying the UIA timeout before reaching the same native fallback.
+                status($"Completed step {step.Number}: entered and verified the recorded value in native Edit {immediateNativeEdit.AutomationId}.");
+                continue;
+            }
+            if (element is null && step.Action == "click" &&
+                step.Target is { AutomationId: null, ClassName: null,
+                    ControlType: "ControlType.Button" or "ControlType.RadioButton" or "ControlType.CheckBox",
+                    Process: { Length: > 0 }, Window: { Length: > 0 }, Name: { Length: > 0 } })
+            {
+                // Controls captured without UIA identifiers are the legacy/native fallback case.
+                // Try the same unique name, role and window checks immediately; richer UIA controls
+                // still follow the normal path used by Excel, sample desktop application and browser recordings.
+                var nativeWindows = FindNativeWindows(step.Target.Process, step.Target.Window);
+                if (nativeWindows.Count == 1)
+                {
+                    var legacyWindow = nativeWindows[0].Dialog;
+                    var roles = step.Target.ControlType switch
+                    {
+                        "ControlType.RadioButton" => new[] { 0x2D },
+                        "ControlType.CheckBox" => new[] { 0x2C },
+                        _ => new[] { 0x2B, 0x2D, 0x2C }
+                    };
+                    if (roles.Any(role => MsaaActions.TryInvokeUnique(legacyWindow, step.Target.Name, role)) ||
+                        TryClickUniqueNativeButton(legacyWindow, step.Target.Name, step.Target.ControlType))
+                    {
+                        if (NormalizeNativeCaption(step.Target.Name).Equals("Save Close",
+                            StringComparison.OrdinalIgnoreCase) && index + 1 < plan.Steps.Count &&
+                            plan.Steps[index + 1].Target?.Window != step.Target.Window)
+                        {
+                            for (var wait = 0; wait < 20 && IsWindowVisible(legacyWindow); wait++)
+                                await Task.Delay(100, token);
+                            if (IsWindowVisible(legacyWindow))
+                                throw new InvalidOperationException($"Step {step.Number}: '{step.Target.Name}' was invoked, but '{step.Target.Window}' remained open.");
+                        }
+                        else await Task.Delay(150, token);
+                        status($"Completed step {step.Number}: invoked unique legacy control '{step.Target.Name}'.");
+                        continue;
+                    }
+                }
+            }
             if ((step.Action == "key" && step.Target.ControlType == "ControlType.ListItem") ||
                 (step.Action == "context-click" && step.Target.ControlType == "ControlType.Text" &&
                  index > 0 && plan.Steps[index - 1].Key?.Contains("Shift+End", StringComparison.OrdinalIgnoreCase) == true))
@@ -1478,7 +2238,7 @@ internal static class Executor
                     throw new InvalidOperationException($"Step {step.Number}: the selected list row lost focus; the action cannot be sent safely.");
             }
             else element = await FindAsync(step.Target, token,
-                step.Target.ControlType == "ControlType.MenuItem" ? 1 :
+                step.Target.ControlType == "ControlType.MenuItem" ? 20 :
                 FollowsHorizontalScroll(plan, index) ? 2 : 20);
             if (element is null && FollowsHorizontalScroll(plan, index))
             {
@@ -1498,6 +2258,14 @@ internal static class Executor
                 status($"Step {step.Number}: checking that the target program is enlarged before searching again.");
                 await EnsureApplicationWindowAsync(step.Target.Process, step.Target.Window, status, token);
                 element = await FindAsync(step.Target, token, 5);
+            }
+            if (element is null && step.Action == "click" &&
+                step.Target.ControlType == "ControlType.MenuItem" &&
+                TryInvokeRecordedLegacyMenu(step.Target))
+            {
+                status($"Completed step {step.Number}: invoked unique legacy menu item '{step.Target.Name}'.");
+                await Task.Delay(150, token);
+                continue;
             }
             if (element is null && step.Target.ControlType == "ControlType.MenuItem" &&
                 !string.IsNullOrWhiteSpace(step.Target.ParentName))
@@ -1529,8 +2297,10 @@ internal static class Executor
             }
             if (element is null && step.Target.ControlType == "ControlType.MenuItem" && index > 0)
             {
-                var previous = plan.Steps[index - 1].Target;
-                if (previous is not null)
+                var previousStep = plan.Steps[index - 1];
+                var previous = previousStep.Target;
+                if (previous is not null && previousStep.Action == "context-click" &&
+                    string.Equals(previous.Process, step.Target.Process, StringComparison.OrdinalIgnoreCase))
                 {
                     status("Opening context menu from the current selection");
                     var focused = AutomationElement.FocusedElement;
@@ -1558,6 +2328,12 @@ internal static class Executor
                             }
                             element = await FindAsync(step.Target, token, 2);
                         }
+                    }
+                    if (element is null && step.Action == "click" && TryInvokeRecordedLegacyMenu(step.Target))
+                    {
+                        status($"Completed step {step.Number}: invoked unique legacy menu item '{step.Target.Name}'.");
+                        await Task.Delay(150, token);
+                        continue;
                     }
                 }
             }
@@ -1635,6 +2411,7 @@ internal static class Executor
                 continue;
             }
             if (step.Target.ControlType != "ControlType.MenuItem" &&
+                !(step.Target.Process == "EXCEL" && step.Target.ClassName == "NetUIGalleryButton") &&
                 !(step.Target.Window == "Find and Replace" && step.Target.ClassName == "EDTBX" &&
                   step.Action is "click" or "type")) ActivateWindow(element);
             if (step.Action == "click" && step.Target.ControlType == "ControlType.TitleBar" &&
@@ -1731,6 +2508,15 @@ internal static class Executor
                 status($"Completed step {step.Number}: opened context menu from its live UIA target. {contextDetail}");
                 continue;
             }
+            if (step is { Action: "click", Target: { Process: "EXCEL",
+                ClassName: "NetUIGalleryButton" } })
+            {
+                if (!TryClickLiveUiaElement(element, null, rightClick: false, out var galleryDetail))
+                    throw new InvalidOperationException($"Step {step.Number}: gallery command could not be clicked safely. {galleryDetail}");
+                await Task.Delay(150, token);
+                status($"Completed step {step.Number}: clicked the verified live gallery command '{step.Target.Name}'.");
+                continue;
+            }
             var before = Automation.State(element);
             if (step.Action == "click" && step.Target.Name == "Delete" &&
                 step.Target.ControlType == "ControlType.MenuItem" && index > 0 &&
@@ -1776,7 +2562,7 @@ internal static class Executor
                 MovePointerAwayFrom(element);
                 await Task.Delay(150, token); // Let the button's hover rendering settle.
             }
-            var refreshWatch = refresh ? WatchRefreshAsync(element, step.Target, token) : null;
+            var refreshWatch = refresh ? WatchRefreshAsync(element, step.Target, token, refreshTimeout) : null;
             if (refresh) await Task.Delay(50, token); // Let the watcher start before invoking the control.
             var tablePaste = step.Action == "key" && step.Key is "Control+V" or "Ctrl+V" &&
                 step.Target.ControlType == "ControlType.DataItem" ? TableClipboardLength() : 0;
@@ -1787,8 +2573,11 @@ internal static class Executor
             else
             {
                 try { await Task.Run(() => Act(element, step), token); }
-                catch (COMException ex) when (step.Action == "click")
+                catch (Exception ex) when (step.Action == "click" &&
+                    ex is COMException or InvalidOperationException)
                 {
+                    // Some native and elevated UIA providers advertise an action pattern but reject it
+                    // when invoked. Reacquire the live control and use the existing hit-tested click path.
                     Trace.WriteLine(ex);
                     var live = await FindAsync(step.Target, token, 3);
                     if (live is null)
@@ -1827,6 +2616,25 @@ internal static class Executor
                 SendKeys.SendWait("{TAB}"); // Move focus away so refresh state can be observed.
                 MovePointerAwayFrom(element);
                 status($"Waiting for {step.Target.Name} to return to its prior state");
+                status($"Refresh completion timeout: {refreshTimeout.TotalSeconds:0} seconds; continuing early if the prior state is restored.");
+                var delayedOptionalHandled = false;
+                while (pendingOptionalStep is not null && !refreshWatch!.IsCompleted)
+                {
+                    if (await TryPerformDelayedOptionalStepAsync(pendingOptionalStep, token, 1))
+                    {
+                        status($"Completed delayed optional step {pendingOptionalStep.Number}: {pendingOptionalStep.Target?.Name} appeared while the fallback action was running.");
+                        pendingOptionalStep = null;
+                        priorConditionalControlWasAbsent = false;
+                        delayedOptionalHandled = true;
+                        break;
+                    }
+                    await Task.Delay(100, token);
+                }
+                if (delayedOptionalHandled)
+                {
+                    status($"Completed step {step.Number}: the delayed optional branch took over from the fallback refresh.");
+                    continue;
+                }
                 var refreshResult = await refreshWatch!;
                 if (refreshResult is null)
                 {
@@ -1841,7 +2649,8 @@ internal static class Executor
                 var nextRecordsAcknowledgement = index + 1 < plan.Steps.Count &&
                     plan.Steps[index + 1].Target?.Window == "Microsoft Excel" &&
                     plan.Steps[index + 1].Target?.Name == "OK";
-                var result = await DismissReplaceAllResultAsync(token, !nextRecordsAcknowledgement);
+                var result = await DismissReplaceAllResultAsync(token, !nextRecordsAcknowledgement, element.Current.ProcessId,
+                    handleUnexpectedDialog);
                 status($"Completed step {step.Number}: Replace All returned: {result}");
             }
             else if (step.Action == "click") await WaitForStableAsync(step.Target, before, token);
@@ -1950,11 +2759,22 @@ internal static class Executor
         return true;
     }
 
-    private static async Task<string> ApplyRecordedReplacementAsync(PlanStep step, CancellationToken token)
+    private static async Task<string> ApplyRecordedReplacementAsync(PlanStep step, CancellationToken token,
+        Func<string, bool>? handleResultProblem = null)
     {
         if (string.IsNullOrWhiteSpace(step.Value) || step.ExpectedState is null)
             throw new InvalidOperationException($"Step {step.Number}: the replacement mapping is incomplete.");
-        var handle = FindDesktopWindow(step.Target?.Process ?? "EXCEL", "Find and Replace", exactOnly: true);
+        nint handle = 0;
+        for (var attempt = 0; attempt < 30 && handle == 0; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            handle = FindVisibleNativeWindow(step.Target?.Process ?? "EXCEL", "Find and Replace",
+                step.Target?.ProcessId);
+            if (handle == 0)
+                handle = FindVisibleNativeWindow(step.Target?.Process ?? "EXCEL", "Find and Replace");
+            if (handle != 0 && !AutomationElement.FromHandle(handle).Current.IsEnabled) handle = 0;
+            if (handle == 0) await Task.Delay(100, token);
+        }
         if (handle == 0)
             throw new InvalidOperationException($"Step {step.Number}: Find and Replace is unavailable.");
         ShowWindow(handle, 9);
@@ -1986,8 +2806,8 @@ internal static class Executor
             ((InvokePattern)invoke).Invoke();
         else if (!TryClickLiveUiaElement(button, null, rightClick: false, out var detail))
             throw new InvalidOperationException($"Step {step.Number}: Replace All could not be clicked. {detail}");
-        var result = await DismissReplaceAllResultAsync(token, dismiss: true);
-        return $"replaced '{step.Value}' with '{step.ExpectedState}'. {result}";
+        var result = await DismissReplaceAllResultAsync(token, dismiss: true, dialog.Current.ProcessId, handleResultProblem);
+        return $"Replace All '{step.Value}' → '{step.ExpectedState}': {result}";
     }
 
     private static Task CloseCompletedReplacementDialogAsync(CancellationToken token) =>
@@ -1999,11 +2819,14 @@ internal static class Executor
         if (string.IsNullOrWhiteSpace(target.Process) || string.IsNullOrWhiteSpace(target.Window))
             throw new InvalidOperationException("The recorded window identity is incomplete.");
         var handle = target.Window == "Find and Replace"
-            ? FindVisibleNativeWindow(target.Process, target.Window)
+            ? FindVisibleNativeWindow(target.Process, target.Window, target.ProcessId)
             : FindDesktopWindow(target.Process, target.Window, exactOnly: true);
+        if (handle == 0 && target.Window == "Find and Replace")
+            handle = FindVisibleNativeWindow(target.Process, target.Window);
         if (handle == 0 && target.Window == "Find and Replace")
             handle = FindDesktopWindow(target.Process, target.Window, exactOnly: true);
         if (handle == 0 || !IsWindowVisible(handle)) return;
+        GetWindowThreadProcessId(handle, out var closingProcess);
         var dialog = AutomationElement.FromHandle(handle);
         var close = dialog.FindFirst(TreeScope.Descendants, new AndCondition(
             new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
@@ -2021,14 +2844,12 @@ internal static class Executor
             throw new InvalidOperationException($"{target.Window} stayed open after its recorded close action.");
         if (target.Window == "Find and Replace")
         {
-            var remaining = FindDesktopWindow(target.Process, target.Window, exactOnly: true);
-            if (FindVisibleNativeWindow(target.Process, target.Window) != 0 ||
-                remaining != 0 && IsWindowVisible(remaining))
+            if (FindVisibleNativeWindow(target.Process, target.Window, (int)closingProcess) != 0)
                 throw new InvalidOperationException("Find and Replace remained visible after its close action.");
         }
     }
 
-    private static nint FindVisibleNativeWindow(string processName, string windowName)
+    private static nint FindVisibleNativeWindow(string processName, string windowName, int? expectedProcessId = null)
     {
         nint match = 0;
         EnumWindows((handle, _) =>
@@ -2036,6 +2857,7 @@ internal static class Executor
             if (!IsWindowVisible(handle) || !GetNativeWindowTitle(handle).Equals(windowName,
                 StringComparison.OrdinalIgnoreCase)) return true;
             GetWindowThreadProcessId(handle, out var processId);
+            if (expectedProcessId is not null && processId != expectedProcessId) return true;
             if (processId == 0) return true;
             try
             {
@@ -2052,52 +2874,108 @@ internal static class Executor
         return match;
     }
 
-    private static async Task<string> DismissReplaceAllResultAsync(CancellationToken token, bool dismiss)
+    private static async Task<string> DismissReplaceAllResultAsync(CancellationToken token, bool dismiss,
+        int? processId = null, Func<string, bool>? handleResultProblem = null)
     {
-        for (var attempt = 0; attempt < 50; attempt++)
+        var watch = Stopwatch.StartNew();
+        while (watch.Elapsed < TimeSpan.FromSeconds(10))
         {
             token.ThrowIfCancellationRequested();
-            var windows = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition)
-                .Cast<AutomationElement>().ToList();
-            var foreground = GetForegroundWindow();
-            if (foreground != 0) windows.Insert(0, AutomationElement.FromHandle(foreground));
-            foreach (AutomationElement popup in windows)
+            var handles = new List<nint>();
+            EnumWindows((handle, _) =>
             {
+                if (!IsWindowVisible(handle)) return true;
+                GetWindowThreadProcessId(handle, out var id);
+                if (processId is not null && id != processId) return true;
                 try
                 {
-                    var process = Process.GetProcessById(popup.Current.ProcessId).ProcessName;
-                    if (!process.Equals("EXCEL", StringComparison.OrdinalIgnoreCase)) continue;
-                    var labels = popup.FindAll(TreeScope.Descendants,
-                        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text));
-                    var message = string.Join(" ", labels.Cast<AutomationElement>()
-                        .Select(label => label.Current.Name).Where(value => !string.IsNullOrWhiteSpace(value)));
-                    if (!(message.Contains("All done.", StringComparison.OrdinalIgnoreCase) &&
-                          message.Contains("replacement", StringComparison.OrdinalIgnoreCase) ||
-                          message.Contains("couldn't find anything to replace", StringComparison.OrdinalIgnoreCase))) continue;
-                    if (dismiss)
+                    if (GetWindow(handle, 4) != 0 &&
+                        Process.GetProcessById((int)id).ProcessName.Equals("EXCEL", StringComparison.OrdinalIgnoreCase) &&
+                        GetNativeWindowTitle(handle) != "Find and Replace")
+                        handles.Add(handle);
+                }
+                catch (ArgumentException) { }
+                return true;
+            }, 0);
+            foreach (var handle in handles)
+            {
+                AutomationElement popup;
+                string message;
+                AutomationElement? ok;
+                try
+                {
+                    popup = AutomationElement.FromHandle(handle);
+                    var nodes = new List<AutomationElement> { popup };
+                    var walker = TreeWalker.RawViewWalker;
+                    for (var index = 0; index < nodes.Count && nodes.Count < 150; index++)
                     {
-                        var ok = popup.FindFirst(TreeScope.Descendants, new AndCondition(
-                            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
-                            new PropertyCondition(AutomationElement.NameProperty, "OK")));
-                        if (ok is null) throw new InvalidOperationException("Excel displayed a replacement result without an OK button.");
-                        if (ok.TryGetCurrentPattern(InvokePattern.Pattern, out var invoke))
-                            ((InvokePattern)invoke).Invoke();
-                        else if (!TryClickLiveUiaElement(ok, null, rightClick: false, out var detail))
-                            throw new InvalidOperationException("Could not dismiss Excel's replacement result. " + detail);
+                        for (var child = walker.GetFirstChild(nodes[index]); child is not null && nodes.Count < 150;
+                            child = walker.GetNextSibling(child)) nodes.Add(child);
                     }
-                    if (message.Contains("couldn't find", StringComparison.OrdinalIgnoreCase) ||
-                        Regex.IsMatch(message, @"\b0\s+replacements?\b", RegexOptions.IgnoreCase))
-                        throw new InvalidOperationException("Replace All found no matching cells: " + message);
-                    return message;
+                    message = string.Join(" ", nodes.Select(node => node.Current.Name)
+                        .Where(value => !string.IsNullOrWhiteSpace(value)).Distinct());
+                    if (!IsReplacementResult(message)) continue;
+                    ok = nodes.FirstOrDefault(node => node.Current.ControlType == ControlType.Button &&
+                        node.Current.Name.Replace("&", "") == "OK");
                 }
                 catch (Exception ex) when (ex is ElementNotAvailableException or System.Runtime.InteropServices.COMException or
-                    ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
-                { System.Diagnostics.Trace.WriteLine(ex); }
+                    ArgumentException or System.ComponentModel.Win32Exception)
+                { System.Diagnostics.Trace.WriteLine(ex); continue; }
+                if (dismiss)
+                {
+                    string? failure = null;
+                    if (ok is null) failure = "Its OK button was not found through accessibility.";
+                    else
+                    {
+                        try
+                        {
+                            if (ok.TryGetCurrentPattern(InvokePattern.Pattern, out var invoke))
+                                ((InvokePattern)invoke).Invoke();
+                            else if (!TryClickLiveUiaElement(ok, null, rightClick: false, out var detail))
+                                failure = "Its OK button could not be activated. " + detail;
+                        }
+                        catch (Exception ex) when (ex is ElementNotAvailableException or COMException or InvalidOperationException)
+                        { failure = "Its OK button could not be activated: " + ex.Message; }
+                    }
+                    if (failure is not null)
+                    {
+                        var kind = IsNoMatchReplacementResult(message)
+                            ? "no-match replacement warning" : "replacement success result";
+                        var question = $"Replay needs help: Excel displayed a {kind}.\n\n{message}\n\n{failure}\n\n" +
+                            "Dismiss this result in Excel, then choose I've handled it to continue. Replay will verify that the result is closed. Choose Stop replay to cancel.";
+                        if (handleResultProblem is null || !handleResultProblem(question))
+                            throw new InvalidOperationException($"Excel {kind} was not acknowledged. {failure} Result: {message}");
+                        token.ThrowIfCancellationRequested();
+                    }
+                    for (var attempt = 0; attempt < 30 && IsWindowVisible(handle); attempt++)
+                        await Task.Delay(100, token);
+                    if (IsWindowVisible(handle))
+                    {
+                        var kind = IsNoMatchReplacementResult(message)
+                            ? "no-match replacement warning" : "replacement success result";
+                        if (failure is not null || handleResultProblem is null ||
+                            !handleResultProblem($"Replay needs help: Excel's {kind} remains open after attempting its OK button.\n\n" +
+                                message + "\n\nDismiss this result in Excel, then choose I've handled it to continue. Replay will verify it has closed. Choose Stop replay to cancel."))
+                            throw new InvalidOperationException($"Excel's {kind} remained open after acknowledgement: " + message);
+                        token.ThrowIfCancellationRequested();
+                        if (IsWindowVisible(handle))
+                            throw new InvalidOperationException($"Excel's {kind} is still open after manual assistance: " + message);
+                    }
+                }
+                return message;
             }
             await Task.Delay(100, token);
         }
         throw new InvalidOperationException("Replace All was clicked, but Excel did not show a verifiable result.");
     }
+
+    private static bool IsReplacementResult(string message) =>
+        Regex.IsMatch(message, @"\b(?:made\s+\d+\s+replacements?|(?:couldn['’]t|cannot|can['’]t|could\s+not)\s+find\s+anything\s+to\s+replace|0\s+replacements?)\b",
+            RegexOptions.IgnoreCase);
+
+    private static bool IsNoMatchReplacementResult(string message) =>
+        Regex.IsMatch(message, @"\b(?:(?:couldn['’]t|cannot|can['’]t|could\s+not)\s+find\s+anything\s+to\s+replace|0\s+replacements?)\b",
+            RegexOptions.IgnoreCase);
 
     private static bool IsRefreshControl(ControlRef target) =>
         target.ControlType == "ControlType.Button" &&
@@ -2176,21 +3054,39 @@ internal static class Executor
     }
 
     private static Task<string?> WatchRefreshAsync(AutomationElement original, ControlRef target,
-        CancellationToken token)
+        CancellationToken token, TimeSpan timeout)
     {
         var before = RefreshSnapshot(original);
+        var beforeState = RefreshCompletionState(original);
         return Task.Run(async () =>
         {
-            var deadline = DateTime.UtcNow.AddSeconds(20);
+            var deadline = DateTime.UtcNow.Add(timeout);
             var changedSamples = 0;
             var returnedSamples = 0;
             var sawSustainedChange = false;
+            var semanticChangedSamples = 0;
+            var sawSemanticChange = false;
             while (DateTime.UtcNow < deadline)
             {
                 token.ThrowIfCancellationRequested();
                 var state = RefreshSnapshot(original);
-                if (state is null) state = RefreshSnapshot(Automation.Resolve(target));
-                if (state is null || state != before)
+                var live = original;
+                if (state is null)
+                {
+                    live = Automation.Resolve(target);
+                    state = RefreshSnapshot(live);
+                }
+                var completionState = RefreshCompletionState(live);
+                if (completionState != beforeState)
+                {
+                    if (++semanticChangedSamples >= 3) sawSemanticChange = true;
+                }
+                else semanticChangedSamples = 0;
+                if (sawSemanticChange && beforeState is not null && completionState == beforeState)
+                {
+                    if (++returnedSamples >= 3) return "state-restored";
+                }
+                else if (state is null || state != before)
                 {
                     if (++changedSamples >= 3) sawSustainedChange = true;
                     returnedSamples = 0;
@@ -2204,6 +3100,19 @@ internal static class Executor
             }
             return null;
         }, token);
+    }
+
+    private static string? RefreshCompletionState(AutomationElement? element)
+    {
+        try
+        {
+            if (element is null) return null;
+            var current = element.Current;
+            if (!current.IsEnabled || current.IsOffscreen) return null;
+            return $"{current.Name};{current.ItemStatus};{Automation.State(element)}";
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException)
+        { Trace.WriteLine(ex); return null; }
     }
 
     private static void PauseForUnexpectedDialog(string? processName, HashSet<string?> knownWindows,
@@ -2226,6 +3135,8 @@ internal static class Executor
         EnumWindows((handle, _) =>
         {
             GetWindowThreadProcessId(handle, out var processId);
+            // A changed title on an application's main top-level window is not a dialog.
+            // The working implementation first required a native owner relationship.
             if (processId == 0 || !IsWindowVisible(handle) || GetWindow(handle, 4) == 0) return true;
             try
             {
@@ -2234,13 +3145,17 @@ internal static class Executor
                 var title = new StringBuilder(256);
                 GetWindowText(handle, title, title.Capacity);
                 var name = title.ToString();
-                if (!string.IsNullOrWhiteSpace(name) && !knownWindows.Contains(name))
+                if (!string.IsNullOrWhiteSpace(name) &&
+                    !knownWindows.Any(recorded => WindowTitlesReferToSameWindow(recorded, name)))
                 { ownedPopup = name; return false; }
             }
             catch (ArgumentException) { }
             return true;
         }, 0);
         if (ownedPopup is not null) return ownedPopup;
+
+        // Some genuine modal dialogs have no native owner. Preserve the working
+        // UI Automation modal/#32770 check for those windows.
         var windows = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition);
         foreach (AutomationElement window in windows)
         {
@@ -2249,15 +3164,95 @@ internal static class Executor
                 if (!Process.GetProcessById(window.Current.ProcessId).ProcessName
                     .Equals(processName, StringComparison.OrdinalIgnoreCase)) continue;
                 var name = window.Current.Name;
-                if (knownWindows.Contains(name)) continue;
+                if (knownWindows.Any(recorded => WindowTitlesReferToSameWindow(recorded, name))) continue;
                 var modal = window.TryGetCurrentPattern(WindowPattern.Pattern, out var pattern) &&
                     ((WindowPattern)pattern).Current.IsModal;
                 if (modal || window.Current.ClassName == "#32770")
                     return string.IsNullOrWhiteSpace(name) ? "Untitled dialog" : name;
             }
-            catch (Exception ex) when (ex is ElementNotAvailableException or ArgumentException or InvalidOperationException) { }
+            catch (Exception ex) when (ex is ElementNotAvailableException or ArgumentException or InvalidOperationException)
+            { Trace.WriteLine(ex); }
         }
         return null;
+    }
+
+    private static bool WindowTitlesReferToSameWindow(string? recorded, string live)
+    {
+        if (string.IsNullOrWhiteSpace(recorded) || string.IsNullOrWhiteSpace(live)) return false;
+        static string Clean(string value) => value.Replace("\u200b", "").Trim();
+        var left = Clean(recorded);
+        var right = Clean(live);
+        if (left.Equals(right, StringComparison.OrdinalIgnoreCase)) return true;
+        var shorter = left.Length <= right.Length ? left : right;
+        var longer = left.Length <= right.Length ? right : left;
+        // Desktop applications commonly append account, protection, compatibility,
+        // or status text after the stable document/application title.
+        return shorter.Length >= 12 &&
+            (longer.StartsWith(shorter + " - ", StringComparison.OrdinalIgnoreCase) ||
+             longer.StartsWith(shorter + " | ", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsGridFocusBeforeCommand(PlanStep step, PlanStep? next) =>
+        step.Action == "click" && step.Target is
+            { ControlType: "ControlType.Table" or "ControlType.DataGrid" or "ControlType.Pane" } target &&
+        string.IsNullOrWhiteSpace(step.ExpectedState) &&
+        (string.IsNullOrWhiteSpace(step.Intent) ||
+            next?.Action == "click-if-previous-absent" &&
+            string.Equals(step.Intent, next.Intent, StringComparison.Ordinal)) &&
+        string.IsNullOrWhiteSpace(step.Value) && string.IsNullOrWhiteSpace(step.Key) &&
+        string.IsNullOrWhiteSpace(step.TargetStrategy) &&
+        (target.ControlType == "ControlType.Table" ||
+            target.ControlType == "ControlType.Pane" && target.Process == "EXCEL" &&
+                target.ClassName == "ExcelGrid" ||
+            target.ControlType == "ControlType.DataGrid" && string.IsNullOrWhiteSpace(target.Name)) &&
+        next?.Action is "click" or "click-if-previous-absent" or "filter-values" && next.Target is { } command &&
+        !string.IsNullOrWhiteSpace(target.Process) &&
+        command.Process == target.Process &&
+        command.Window == target.Window &&
+        command.ControlType is "ControlType.Button" or "ControlType.MenuItem";
+
+    private static bool IsStaticLabelNavigation(PlanStep step, PlanStep? next) =>
+        step.Action == "click" && step.Target is
+            { ControlType: "ControlType.Text", ClassName: { } className } target &&
+        (className.Equals("Static", StringComparison.OrdinalIgnoreCase) ||
+         className.StartsWith("WindowsForms10.Static.", StringComparison.Ordinal)) &&
+        string.IsNullOrWhiteSpace(step.Intent) && string.IsNullOrWhiteSpace(step.ExpectedState) &&
+        string.IsNullOrWhiteSpace(step.Value) && step.OriginIntent is null &&
+        next?.Action is "click" or "ensure-state" && next.Target is { } command &&
+        !string.IsNullOrWhiteSpace(target.Process) && command.Process == target.Process &&
+        command.Window == target.Window && !string.IsNullOrWhiteSpace(command.Name) &&
+        command.ControlType is "ControlType.Button" or "ControlType.MenuItem" or "ControlType.HeaderItem";
+
+    private static bool IsConditionalStep(PlanStep step)
+    {
+        if (step.Action == "optional-click") return true;
+        if (step.Action != "click" || string.IsNullOrWhiteSpace(step.Target?.Name)) return false;
+        var text = string.Join(' ', new[] { step.Intent, step.Explanation }
+            .Where(value => !string.IsNullOrWhiteSpace(value))!);
+        var name = Regex.Escape(step.Target.Name);
+        var commandConditional = Regex.IsMatch(text,
+                   @"\bif\s+present\s*,?\s*(?:click|press|invoke)\s+" + name + @"(?!\w)|" +
+                   @"\b(?:click|press|invoke)\s+" + name + @"\s+if\s+present\b",
+                   RegexOptions.IgnoreCase);
+        var namedDialogConditional = step.Target.ControlType == "ControlType.Button" &&
+            !string.IsNullOrWhiteSpace(step.Target.Window) &&
+            !string.IsNullOrWhiteSpace(step.Intent) &&
+            step.Intent.Contains('"' + step.Target.Window + '"', StringComparison.OrdinalIgnoreCase) &&
+            Regex.IsMatch(step.Intent, @"(?<!\w)" + name + @"(?!\w)", RegexOptions.IgnoreCase) &&
+            Regex.IsMatch(step.Intent, @"\bif\s+(?:present|(?:it|the\s+(?:dialog|pop\s*up))\s+appears)\b",
+                RegexOptions.IgnoreCase);
+        return IsRecordedOccasionalDialog(step) || (commandConditional || namedDialogConditional) &&
+            Regex.IsMatch(text, @"\botherwise\b", RegexOptions.IgnoreCase);
+    }
+
+    private static bool IsRecordedOccasionalDialog(PlanStep step)
+    {
+        if (step.Action != "click" || step.Target is not
+            { ControlType: "ControlType.Button", ParentName: { Length: > 0 } }) return false;
+        var text = string.Join(' ', new[] { step.Intent, step.Explanation }
+            .Where(value => !string.IsNullOrWhiteSpace(value))!);
+        return Regex.IsMatch(text, @"\b(?:doesn['’]?t|does\s+not)\s+always\s+appear\b",
+            RegexOptions.IgnoreCase);
     }
 
     private static async Task<AutomationElement?> FindFirstListRowAsync(ControlRef target, CancellationToken token)
@@ -2618,6 +3613,73 @@ internal static class Executor
         }
     }
 
+    private static bool TryInvokeUniqueExactWindowsSearchResult(string query, out string detail)
+    {
+        detail = "no unique exact Windows Search result was exposed";
+        var matches = new Dictionary<string, AutomationElement>(StringComparer.Ordinal);
+        try
+        {
+            // Limit the query to SearchHost's visible top-level windows. A desktop-wide descendant
+            // search is extremely slow on busy desktops and made a simple Enter take over a minute.
+            var windows = AutomationElement.RootElement.FindAll(TreeScope.Children,
+                Condition.TrueCondition);
+            foreach (AutomationElement window in windows)
+            {
+                try
+                {
+                    var windowCurrent = window.Current;
+                    if (windowCurrent.IsOffscreen || windowCurrent.BoundingRectangle.IsEmpty ||
+                        !Process.GetProcessById(windowCurrent.ProcessId).ProcessName.Equals(
+                            "SearchHost", StringComparison.OrdinalIgnoreCase)) continue;
+                    foreach (AutomationElement candidate in window.FindAll(TreeScope.Descendants,
+                        new PropertyCondition(AutomationElement.NameProperty, query,
+                            PropertyConditionFlags.IgnoreCase)))
+                    {
+                        var current = candidate.Current;
+                        if (!current.IsEnabled || current.IsOffscreen || current.BoundingRectangle.IsEmpty) continue;
+                        var actionable = Automation.ActionableAncestor(candidate);
+                        if (actionable is null) continue;
+                        var runtimeId = string.Join(".", actionable.GetRuntimeId());
+                        matches.TryAdd(runtimeId, actionable);
+                    }
+                }
+                catch (Exception ex) when (ex is ElementNotAvailableException or ArgumentException or
+                    InvalidOperationException or COMException) { Trace.WriteLine(ex); }
+            }
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException)
+        {
+            Trace.WriteLine(ex);
+            return false;
+        }
+        if (matches.Count != 1)
+        {
+            detail = matches.Count == 0 ? detail : $"{matches.Count} exact Windows Search results were actionable";
+            return false;
+        }
+        var result = matches.Values.Single();
+        try
+        {
+            if (result.TryGetCurrentPattern(InvokePattern.Pattern, out var invoke))
+                ((InvokePattern)invoke).Invoke();
+            else if (result.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var selection))
+            {
+                ((SelectionItemPattern)selection).Select();
+                SendKeys.SendWait("{ENTER}");
+            }
+            else if (!TryClickLiveUiaElement(result, null, rightClick: false, out detail))
+                return false;
+            detail = $"invoked '{query}'";
+            return true;
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException)
+        {
+            detail = ex.Message;
+            Trace.WriteLine(ex);
+            return false;
+        }
+    }
+
     private static Dictionary<nint, (string Process, string Title)> VisibleApplicationWindows()
     {
         var windows = new Dictionary<nint, (string Process, string Title)>();
@@ -2647,7 +3709,10 @@ internal static class Executor
     private static async Task<(string Process, string Title)?> WaitForNewApplicationWindowAsync(
         IReadOnlyDictionary<nint, (string Process, string Title)> before, CancellationToken token)
     {
-        for (var attempt = 0; attempt < 80; attempt++)
+        // Elevated applications can remain behind the UAC secure desktop and finish creating their
+        // first window well after an ordinary launch. Poll for up to 30 seconds, returning as soon as
+        // the recorded process appears, so a successful UAC launch does not trigger manual help.
+        for (var attempt = 0; attempt < 300; attempt++)
         {
             token.ThrowIfCancellationRequested();
             foreach (var (handle, identity) in VisibleApplicationWindows())
@@ -3407,17 +4472,552 @@ internal static class Executor
         return false;
     }
 
+    internal static bool IsWindowActivationClick(PlanStep step) =>
+        step is
+        {
+            Action: "click", Value: null, Key: null, ExpectedState: null,
+            Target:
+            {
+                ControlType: "ControlType.TitleBar",
+                Process: { Length: > 0 }, Window: { Length: > 0 }
+            }
+        } &&
+        !string.Equals(step.Target.Window, "Find and Replace", StringComparison.OrdinalIgnoreCase) &&
+        (string.Equals(step.Target.Name, step.Target.Window, StringComparison.OrdinalIgnoreCase) ||
+         string.Equals(step.Target.ParentName, step.Target.Window, StringComparison.OrdinalIgnoreCase));
+
     private static async Task<AutomationElement?> FindAsync(ControlRef target, CancellationToken token, int attempts = 20)
     {
+        var menuDeadline = target.ControlType == "ControlType.MenuItem"
+            ? Stopwatch.StartNew() : null;
         for (var i = 0; i < attempts; i++)
         {
             token.ThrowIfCancellationRequested();
             var element = await Task.Run(() => target.ControlType == "ControlType.MenuItem"
                 ? Automation.ResolveMenuItem(target) : Automation.Resolve(target), token);
             if (element is not null) return element;
+            if (menuDeadline is not null && menuDeadline.Elapsed.TotalMilliseconds >= attempts * 100)
+                break;
             await Task.Delay(100, token);
         }
         return null;
+    }
+
+    private static bool TryInvokeRecordedLegacyMenu(ControlRef target)
+    {
+        if (string.IsNullOrWhiteSpace(target.Process) || string.IsNullOrWhiteSpace(target.Window) ||
+            string.IsNullOrWhiteSpace(target.Name) || !string.IsNullOrWhiteSpace(target.AutomationId) ||
+            !string.IsNullOrWhiteSpace(target.ParentName)) return false;
+        var windows = FindNativeWindows(target.Process, target.Window);
+        var foreground = GetForegroundWindow();
+        var foregroundThread = GetWindowThreadProcessId(foreground, out var foregroundProcess);
+        if (foreground == 0 || foregroundThread == 0 || foregroundProcess == 0) return false;
+        string foregroundProcessName;
+        try { foregroundProcessName = Process.GetProcessById((int)foregroundProcess).ProcessName; }
+        catch (ArgumentException) { return false; }
+        if (!foregroundProcessName.Equals(target.Process, StringComparison.OrdinalIgnoreCase)) return false;
+
+        // A transient menu can be attributed to a sibling window when the application owns
+        // several top-level windows. Prefer the recorded owner, then fall back to the active
+        // window in the same process. Do not weaken the foreground-process check above or the
+        // unique-name requirement in TryInvokeUniqueMenu: together they prevent this recovery
+        // from invoking a same-named command in another app or an ambiguous menu.
+        var root = windows.Count == 1 ? windows[0].Root : foreground;
+        var thread = GetWindowThreadProcessId(root, out var processId);
+        if (thread == 0 || processId == 0) return false;
+        if (foregroundProcess != processId) return false;
+        // Menus are often separate top-level windows, not descendants of the
+        // recorded application window. Never reactivate the owner while searching.
+        var menuWindows = new List<nint>();
+        EnumWindows((popup, _) =>
+        {
+            if (!IsWindowVisible(popup) || popup == root) return true;
+            var popupThread = GetWindowThreadProcessId(popup, out var popupProcess);
+            if (popupProcess != processId || popupThread != thread) return true;
+            var owner = GetWindow(popup, 4);
+            var className = new StringBuilder(256);
+            GetClassName(popup, className, className.Capacity);
+            if (owner == root || windows.Any(candidate => owner == candidate.Root || owner == candidate.Dialog) ||
+                owner == 0 && (className.ToString() == "#32768" ||
+                    className.ToString().Contains("ToolStripDropDown", StringComparison.OrdinalIgnoreCase)))
+                menuWindows.Add(popup);
+            return true;
+        }, 0);
+        var ownerWindow = windows.Count == 1 ? windows[0].Dialog : root;
+        return MsaaActions.TryInvokeUniqueMenu(ownerWindow, menuWindows, target.Name);
+    }
+
+    private static async Task<bool> WaitForOptionalStepAsync(PlanStep step,
+        CancellationToken token, TimeSpan timeout)
+    {
+        var watch = Stopwatch.StartNew();
+        do
+        {
+            if (await TryPerformDelayedOptionalStepAsync(step, token, 1)) return true;
+            var remaining = timeout - watch.Elapsed;
+            if (remaining <= TimeSpan.Zero) break;
+            await Task.Delay(remaining < TimeSpan.FromMilliseconds(100)
+                ? remaining : TimeSpan.FromMilliseconds(100), token);
+        } while (true);
+        return await TryPerformDelayedOptionalStepAsync(step, token, 1);
+    }
+
+    private static async Task WaitForOptionalOutcomeAsync(IReadOnlyList<PlanStep> steps, int index,
+        Action<string> status, CancellationToken token)
+    {
+        var fallback = steps[index];
+        var nextIndex = index + 1;
+        while (nextIndex + 1 < steps.Count &&
+            IsStaticLabelNavigation(steps[nextIndex], steps[nextIndex + 1])) nextIndex++;
+        if (nextIndex >= steps.Count || steps[nextIndex].Target is not { } next ||
+            next.Process != fallback.Target?.Process) return;
+        status($"Waiting for the optional action's resulting view: {next.Name}. The fallback command will not be clicked.");
+        await WaitForReadyControlAsync(next, token, TimeSpan.FromSeconds(120),
+            fallback.TargetStrategy != "unique-refresh-command" &&
+                IsRefreshControl(fallback.Target!) ? fallback.Target : null);
+        status($"The resulting view is ready for step {steps[nextIndex].Number}: {next.Name}.");
+    }
+
+    private static async Task WaitForReadyControlAsync(ControlRef target, CancellationToken token,
+        TimeSpan timeout, ControlRef? completionControl = null,
+        string failureContext = "The optional action's resulting view")
+    {
+        var ready = await WaitForStableReadinessAsync(async () =>
+        {
+            var ready = await OptionalNextControlReadyAsync(target, token);
+            if (ready && completionControl is not null)
+                ready = await OptionalNextControlReadyAsync(completionControl, token);
+            if (ready && target.ControlType == "ControlType.HeaderItem")
+            {
+                try
+                {
+                    var header = await FindAsync(target, token, 1);
+                    ready = header is not null &&
+                        await Task.Run(() => Automation.FirstListItemUnderHeader(header), token) is not null;
+                }
+                catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException)
+                { Trace.WriteLine(ex); ready = false; }
+            }
+            return ready;
+        }, timeout, token);
+        if (ready) return;
+        throw new InvalidOperationException($"{failureContext}: '{target.Name}' in " +
+            $"'{target.Window}' did not expose an enabled, populated view within {timeout.TotalSeconds:0} seconds. " +
+            "Later actions were not executed.");
+    }
+
+    private static async Task<bool> WaitForStableReadinessAsync(Func<Task<bool>> probe,
+        TimeSpan timeout, CancellationToken token)
+    {
+        var watch = Stopwatch.StartNew();
+        var stable = 0;
+        while (watch.Elapsed < timeout)
+        {
+            token.ThrowIfCancellationRequested();
+            var ready = await probe();
+            token.ThrowIfCancellationRequested();
+            if (watch.Elapsed >= timeout) return false;
+            stable = ready ? stable + 1 : 0;
+            if (stable >= 3) return true;
+            var remaining = timeout - watch.Elapsed;
+            await Task.Delay(remaining < TimeSpan.FromMilliseconds(250)
+                ? remaining : TimeSpan.FromMilliseconds(250), token);
+        }
+        return false;
+    }
+
+    private static async Task<bool> OptionalNextControlReadyAsync(ControlRef? target, CancellationToken token)
+    {
+        if (target is not { Process: { Length: > 0 } process, Window: { Length: > 0 } window })
+            return false;
+        try
+        {
+            var handle = FindVisibleNativeWindow(process, window);
+            if (handle == 0 || !AutomationElement.FromHandle(handle).Current.IsEnabled) return false;
+            var element = await FindAsync(target, token, 1);
+            return element is not null && element.Current.IsEnabled && !element.Current.IsOffscreen;
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException)
+        { Trace.WriteLine(ex); return false; }
+    }
+
+    private static async Task<bool> TryPerformDelayedOptionalStepAsync(PlanStep step,
+        CancellationToken token, int attempts)
+    {
+        if (step.Target is not { Process: { Length: > 0 } process } target)
+            return false;
+        if (string.IsNullOrWhiteSpace(target.Window) && IsRecordedOccasionalDialog(step))
+        {
+            for (var attempt = 0; attempt < attempts; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                var embedded = await Task.Run(() => Automation.ResolveUniqueEmbeddedButton(target), token);
+                if (embedded is not null)
+                {
+                    if (embedded.TryGetCurrentPattern(InvokePattern.Pattern, out var embeddedInvoke))
+                        ((InvokePattern)embeddedInvoke).Invoke();
+                    else
+                    {
+                        ActivateWindow(embedded);
+                        Act(embedded, step);
+                    }
+                    return true;
+                }
+                if (attempt + 1 < attempts) await Task.Delay(100, token);
+            }
+            return false;
+        }
+        if (string.IsNullOrWhiteSpace(target.Window)) return false;
+        var window = target.Window;
+        for (var attempt = 0; attempt < attempts; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            if (FindVisibleNativeWindow(process, window) != 0)
+            {
+                var element = await FindAsync(target, token, 20);
+                if (element is null)
+                    throw new InvalidOperationException($"Step {step.Number}: delayed optional window '{window}' appeared, but its recorded control '{target.Name}' was unavailable.");
+                var click = step.Action == "optional-click" ? step with { Action = "click" } : step;
+                if (click.Action == "click" && element.TryGetCurrentPattern(InvokePattern.Pattern, out var invoke))
+                    ((InvokePattern)invoke).Invoke();
+                else
+                {
+                    ActivateWindow(element);
+                    Act(element, click);
+                }
+                return true;
+            }
+            if (attempt + 1 < attempts) await Task.Delay(100, token);
+        }
+        return false;
+    }
+
+    private static async Task<string> FillExcelDownToAdjacentDataEndAsync(PlanStep intentStep,
+        ControlRef sourceTarget, string sourceAddress, string expectedValue, CancellationToken token)
+    {
+        var sourceMatch = Regex.Match(sourceAddress, @"^(?<column>[A-Z]{1,3})(?<row>\d+)$",
+            RegexOptions.IgnoreCase);
+        if (!sourceMatch.Success)
+            throw new InvalidDataException($"Step {intentStep.Number}: '{sourceAddress}' is not a valid Excel source address.");
+        var sourceColumn = sourceMatch.Groups["column"].Value.ToUpperInvariant();
+        var sourceRow = int.Parse(sourceMatch.Groups["row"].Value,
+            System.Globalization.CultureInfo.InvariantCulture);
+        var adjacentState = Regex.Match(intentStep.ExpectedState ?? "",
+            @"^adjacent-column:(?<column>[A-Z]{1,3})$", RegexOptions.IgnoreCase);
+        var adjacentColumn = adjacentState.Success
+            ? adjacentState.Groups["column"].Value.ToUpperInvariant()
+            : PreviousExcelColumn(sourceColumn);
+        if (string.IsNullOrWhiteSpace(sourceTarget.Process))
+            throw new InvalidDataException($"Step {intentStep.Number}: the spreadsheet process identity is missing.");
+        var workbook = FindDesktopWindow(sourceTarget.Process, sourceTarget.Window);
+        if (workbook == 0)
+            throw new InvalidOperationException($"Step {intentStep.Number}: the recorded Excel workbook is unavailable.");
+        ShowWindow(workbook, 9);
+        SetForegroundWindow(workbook);
+        if (GetForegroundWindow() != workbook)
+            throw new InvalidOperationException($"Step {intentStep.Number}: Excel did not take focus for the fill operation.");
+
+        // Commit the preceding entry, then use Excel navigation to discover the live end row.
+        SendKeys.SendWait("{ENTER}");
+        await GoToExcelAddressAsync($"{adjacentColumn}{sourceRow}", token);
+        SendKeys.SendWait("^{DOWN}");
+        await Task.Delay(250, token);
+        var focused = Automation.Describe(AutomationElement.FocusedElement);
+        var endMatch = Regex.Match(focused?.AutomationId ?? focused?.Name ?? "",
+            @"^[A-Z]{1,3}(?<row>\d+)$", RegexOptions.IgnoreCase);
+        if (!endMatch.Success || !int.TryParse(endMatch.Groups["row"].Value,
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var endRow) || endRow < sourceRow)
+            throw new InvalidOperationException($"Step {intentStep.Number}: Excel did not expose the last populated row beside {sourceAddress}.");
+
+        var destinationAddress = $"{sourceColumn}{endRow}";
+        await GoToExcelAddressAsync($"{sourceAddress}:{destinationAddress}", token);
+        SendKeys.SendWait("^d");
+        await Task.Delay(250, token);
+        await GoToExcelAddressAsync(destinationAddress, token);
+        var destination = AutomationElement.FocusedElement;
+        var destinationDescription = Automation.Describe(destination);
+        if (destinationDescription?.AutomationId?.Equals(destinationAddress,
+                StringComparison.OrdinalIgnoreCase) != true)
+            throw new InvalidOperationException($"Step {intentStep.Number}: Excel selected '{destinationDescription?.AutomationId ?? destinationDescription?.Name ?? "unknown"}' instead of {destinationAddress} after filling down.");
+        var actualValue = destination.TryGetCurrentPattern(ValuePattern.Pattern, out var valuePattern)
+            ? ((ValuePattern)valuePattern).Current.Value : null;
+        var resolvedExpected = DynamicText.Resolve(expectedValue, null);
+        if (!string.Equals(actualValue, resolvedExpected, StringComparison.Ordinal))
+            throw new InvalidOperationException($"Step {intentStep.Number}: Excel did not verify '{resolvedExpected}' in {destinationAddress} after filling down.");
+        return destinationAddress;
+    }
+
+    internal static async Task GoToExcelAddressAsync(string address, CancellationToken token)
+    {
+        SendKeys.SendWait("^g");
+        await Task.Delay(150, token);
+        SendKeys.SendWait(string.Concat(address.Select(EscapeText)));
+        SendKeys.SendWait("{ENTER}");
+        await Task.Delay(150, token);
+    }
+
+    private static async Task<AutomationElement> NavigateToVerifiedExcelCellAsync(
+        ControlRef workbook, string address, CancellationToken token)
+    {
+        var parsed = ExcelCellAddress(address);
+        Exception? last = null;
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            // A prior click, fill, or edit can leave Excel in a cell interaction
+            // mode that consumes Ctrl+G. Escape returns to worksheet navigation.
+            SendKeys.SendWait("{ESC}");
+            await Task.Delay(100, token);
+            await GoToExcelAddressAsync(address, token);
+            try { return await WaitForFocusedExcelCellAsync(workbook, parsed.Column, parsed.Row, token); }
+            catch (InvalidOperationException ex) { last = ex; }
+        }
+        throw new InvalidOperationException($"Excel could not navigate reliably to {address} after 3 verified attempts.", last);
+    }
+
+    private static (string Column, int Row) ExcelCellAddress(string address)
+    {
+        var match = Regex.Match(address, @"^(?<column>[A-Z]{1,3})(?<row>[1-9]\d*)$", RegexOptions.IgnoreCase);
+        if (!match.Success || !int.TryParse(match.Groups["row"].Value, out var row) || row > 1048576)
+            throw new InvalidDataException($"'{address}' is not a valid Excel cell address.");
+        return (match.Groups["column"].Value.ToUpperInvariant(), row);
+    }
+
+    private static int ExcelColumnNumber(string column)
+    {
+        var number = 0;
+        foreach (var character in column.ToUpperInvariant())
+            number = checked(number * 26 + character - 'A' + 1);
+        if (number is < 1 or > 16384) throw new InvalidDataException("Invalid Excel column.");
+        return number;
+    }
+
+    private static AutomationElement FocusedVisibleExcelCell(ControlRef workbook, string column, int? row = null)
+    {
+        var focused = AutomationElement.FocusedElement;
+        var target = Automation.Describe(focused);
+        if (target is not { Process: "EXCEL", AutomationId: { Length: > 0 } address } ||
+            (target.ControlType != "ControlType.DataItem" &&
+             !(row == 1 && target.ControlType == "ControlType.HeaderItem")) ||
+            focused.Current.IsOffscreen || !focused.Current.IsEnabled || focused.Current.BoundingRectangle.IsEmpty)
+            throw new InvalidOperationException($"Excel did not expose a visible, focused worksheet cell; focused control: " +
+                $"{target?.ControlType}, '{target?.Name}', ID '{target?.AutomationId}'. No input will be sent.");
+        var parsed = ExcelCellAddress(address);
+        if (parsed.Column != column || row is not null && parsed.Row != row ||
+            GetAncestor(GetForegroundWindow(), 2) != GetAncestor(FindDesktopWindow("EXCEL", workbook.Window), 2))
+            throw new InvalidOperationException($"Excel focused '{address}' outside requested {column}{row?.ToString() ?? ""} or workbook '{workbook.Window}'. " +
+                $"Foreground '{GetNativeWindowTitle(GetForegroundWindow())}', resolved '{GetNativeWindowTitle(FindDesktopWindow("EXCEL", workbook.Window))}'.");
+        return focused;
+    }
+
+    private static string ExcelCellValue(AutomationElement cell) =>
+        cell.TryGetCurrentPattern(ValuePattern.Pattern, out var value)
+            ? ((ValuePattern)value).Current.Value
+            : throw new InvalidOperationException("Excel cell value could not be read for verification.");
+
+    internal static async Task<AutomationElement> WaitForFocusedExcelCellAsync(ControlRef workbook,
+        string column, int? row, CancellationToken token)
+    {
+        string detail = "Worksheet focus was not available.";
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            try { return FocusedVisibleExcelCell(workbook, column, row); }
+            catch (Exception ex) when (ex is InvalidOperationException or ElementNotAvailableException or COMException)
+            { detail = ex.Message; }
+            await Task.Delay(100, token);
+        }
+        throw new InvalidOperationException($"Excel navigation to {column}{row?.ToString() ?? " (visible row)"} was not verified. {detail}");
+    }
+
+    [DllImport("user32.dll")]
+    private static extern nint GetAncestor(nint window, uint flags);
+
+    private static async Task FocusExcelWorksheetAsync(ControlRef workbook, nint handle, CancellationToken token)
+    {
+        if (HasVerifiedExcelCellFocus(workbook)) return;
+        var window = AutomationElement.FromHandle(handle);
+        var cells = window.FindAll(TreeScope.Descendants,
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataItem));
+        foreach (AutomationElement cell in cells)
+        {
+            token.ThrowIfCancellationRequested();
+            var current = cell.Current;
+            var address = Regex.IsMatch(current.AutomationId, @"^[A-Z]{1,3}[1-9]\d*$", RegexOptions.IgnoreCase)
+                ? current.AutomationId : current.Name;
+            if (!Regex.IsMatch(address ?? "", @"^[A-Z]{1,3}[1-9]\d*$", RegexOptions.IgnoreCase) ||
+                !current.IsEnabled || current.IsOffscreen || current.BoundingRectangle.IsEmpty) continue;
+            var parsed = ExcelCellAddress(address!);
+            if (parsed.Row == 1) continue;
+            if (!TryClickLiveUiaElement(cell, null, false, out _)) continue;
+            cell.SetFocus();
+            await WaitForFocusedExcelCellAsync(workbook, parsed.Column, parsed.Row, token);
+            return;
+        }
+        throw new InvalidOperationException("No visible worksheet cell was available to establish keyboard focus for the next navigation. Replay stopped without sending additional cell input.");
+    }
+
+    private static bool HasVerifiedExcelCellFocus(ControlRef workbook)
+    {
+        try
+        {
+            var focused = Automation.Describe(AutomationElement.FocusedElement);
+            if (focused is not { Process: "EXCEL", ControlType: "ControlType.DataItem",
+                AutomationId: { Length: > 0 } address } ||
+                !Regex.IsMatch(address, @"^[A-Z]{1,3}[1-9]\d*$", RegexOptions.IgnoreCase))
+                return false;
+            var parsed = ExcelCellAddress(address);
+            _ = FocusedVisibleExcelCell(workbook, parsed.Column, parsed.Row);
+            return true;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ElementNotAvailableException or COMException)
+        { Trace.WriteLine(ex); return false; }
+    }
+
+    private static async Task<AutomationElement> FirstVisibleExcelDataCellAsync(ControlRef workbook,
+        string column, CancellationToken token)
+    {
+        var handle = FindDesktopWindow("EXCEL", workbook.Window);
+        if (handle == 0) throw new InvalidOperationException("The recorded Excel workbook is unavailable.");
+        if (!HasVerifiedExcelCellFocus(workbook))
+            ActivateWindow(AutomationElement.FromHandle(handle));
+        token.ThrowIfCancellationRequested();
+        if (GetAncestor(GetForegroundWindow(), 2) != GetAncestor(handle, 2))
+            throw new InvalidOperationException("Excel did not take focus for direct worksheet navigation.");
+        await GoToExcelAddressAsync(column + "1", token);
+        _ = await WaitForFocusedExcelCellAsync(workbook, column, 1, token);
+        SendKeys.SendWait("{DOWN}");
+        await Task.Delay(150, token);
+        var first = await WaitForFocusedExcelCellAsync(workbook, column, null, token);
+        if (ExcelCellAddress(Automation.Describe(first)!.AutomationId!).Row <= 1)
+            throw new InvalidOperationException("Excel did not move from the header to a visible data row.");
+        return first;
+    }
+
+    private static async Task<ControlRef> TypeIntoFirstFilteredExcelRowAsync(PlanStep step,
+        string recordedAddress, PlanStep fillStep, CancellationToken token)
+    {
+        var column = ExcelCellAddress(recordedAddress).Column;
+        var first = await FirstVisibleExcelDataCellAsync(step.Target!, column, token);
+        var live = Automation.Describe(first)!;
+        // Validate the adjacent data before seeding a visible fill operation.
+        var adjacentMatch = Regex.Match(fillStep.ExpectedState ?? "", @"^adjacent-column:([A-Z]{1,3})$", RegexOptions.IgnoreCase);
+        if (!adjacentMatch.Success) throw new InvalidDataException("The filtered input has no verified adjacent column.");
+        var adjacent = adjacentMatch.Groups[1].Value.ToUpperInvariant();
+        var distance = ExcelColumnNumber(adjacent) - ExcelColumnNumber(column);
+        if (distance == 0) throw new InvalidDataException("The fill's adjacent column must differ from its destination.");
+        SendKeys.SendWait($"{{{(distance > 0 ? "RIGHT" : "LEFT")} {Math.Abs(distance)}}}");
+        await Task.Delay(100, token);
+        var data = FocusedVisibleExcelCell(step.Target!, adjacent, ExcelCellAddress(live.AutomationId!).Row);
+        if (string.IsNullOrWhiteSpace(ExcelCellValue(data)))
+            throw new InvalidOperationException($"The first visible row has no adjacent data in {adjacent}. No text was entered.");
+        SendKeys.SendWait($"{{{(distance > 0 ? "LEFT" : "RIGHT")} {Math.Abs(distance)}}}");
+        await Task.Delay(100, token);
+        _ = FocusedVisibleExcelCell(step.Target!, column, ExcelCellAddress(live.AutomationId!).Row);
+        var desired = DynamicText.Resolve(step.Value!, step.RelativeWeekday);
+        SendKeys.SendWait(string.Concat(desired.Select(EscapeText)));
+        SendKeys.SendWait("^{ENTER}");
+        await Task.Delay(150, token);
+        var committed = FocusedVisibleExcelCell(step.Target!, column, ExcelCellAddress(live.AutomationId!).Row);
+        if (ExcelCellValue(committed) != desired)
+            throw new InvalidOperationException("Excel did not verify the value in the first visible filtered row.");
+        return step.Target! with { Name = live.AutomationId, AutomationId = live.AutomationId,
+            ClassName = "XLSpreadsheetCell" };
+    }
+
+    private static async Task<string> FillVisibleExcelRowsAsync(PlanStep intentStep,
+        ControlRef source, string expectedValue, CancellationToken token)
+    {
+        var column = ExcelCellAddress(source.AutomationId!).Column;
+        var adjacentMatch = Regex.Match(intentStep.ExpectedState ?? "", @"^adjacent-column:([A-Z]{1,3})$", RegexOptions.IgnoreCase);
+        if (!adjacentMatch.Success) throw new InvalidDataException("The visible fill has no verified adjacent column.");
+        var adjacent = adjacentMatch.Groups[1].Value.ToUpperInvariant();
+        var handle = FindDesktopWindow("EXCEL", source.Window);
+        if (handle == 0) throw new InvalidOperationException("Workbook unavailable for visible-fill verification.");
+        var firstRow = ExcelCellAddress(source.AutomationId!).Row;
+        var rows = ExcelNativeSheet.Read<List<int>>(handle, sheet =>
+            ExcelNativeSheet.VisibleDataRows(sheet, adjacent, firstRow, token));
+        if (rows.Count == 0 || rows[0] != ExcelCellAddress(source.AutomationId!).Row)
+            throw new InvalidOperationException("The filtered rows changed between entry and fill; replay stopped.");
+        var value = DynamicText.Resolve(expectedValue, null);
+        ExcelNativeSheet.Read<bool>(handle, sheet =>
+        {
+            var currentRows = (List<int>)ExcelNativeSheet.VisibleDataRows(sheet, adjacent, firstRow, token);
+            if (!currentRows.SequenceEqual(rows))
+                throw new InvalidOperationException("The filtered rows changed during fill; replay stopped.");
+            ExcelNativeSheet.SetValues(sheet, column, rows, value);
+            return true;
+        });
+        return $"{column}{rows[^1]} ({rows.Count} visible rows; hidden rows unchanged)";
+    }
+
+    private static string PreviousExcelColumn(string column)
+    {
+        var value = 0;
+        foreach (var character in column.ToUpperInvariant())
+            value = checked(value * 26 + character - 'A' + 1);
+        if (value <= 1) throw new InvalidDataException("The first Excel column has no preceding adjacent column.");
+        value--;
+        var result = "";
+        while (value > 0)
+        {
+            value--;
+            result = (char)('A' + value % 26) + result;
+            value /= 26;
+        }
+        return result;
+    }
+
+    private static async Task TypeIntoExcelCellByAddressAsync(PlanStep step, string address,
+        CancellationToken token)
+    {
+        if (!Regex.IsMatch(address, @"^[A-Z]{1,3}[1-9]\d*$", RegexOptions.IgnoreCase))
+            throw new InvalidDataException($"Step {step.Number}: '{address}' is not a valid recorded Excel cell address.");
+        var workbook = FindDesktopWindow("EXCEL", step.Target!.Window);
+        if (workbook == 0)
+            throw new InvalidOperationException($"Step {step.Number}: the recorded Excel workbook is unavailable.");
+        ActivateWindow(AutomationElement.FromHandle(workbook));
+        for (var attempt = 0; attempt < 10 && GetForegroundWindow() != workbook; attempt++)
+            await Task.Delay(50, token);
+        if (GetForegroundWindow() != workbook)
+            throw new InvalidOperationException($"Step {step.Number}: Excel did not take focus before selecting {address}. Requested '{step.Target.Window}', resolved '{GetNativeWindowTitle(workbook)}'; foreground '{GetNativeWindowTitle(GetForegroundWindow())}'.");
+        SendKeys.SendWait("^g");
+        await Task.Delay(150, token);
+        SendKeys.SendWait(string.Concat(address.Select(EscapeText)));
+        SendKeys.SendWait("{ENTER}");
+        AutomationElement? selected = null;
+        for (var attempt = 0; attempt < 15; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            selected = await FindAsync(step.Target, token, 1);
+            try
+            {
+                if (selected is not null && !selected.Current.IsOffscreen &&
+                    selected.Current.IsEnabled && !selected.Current.BoundingRectangle.IsEmpty) break;
+            }
+            catch (ElementNotAvailableException) { selected = null; }
+            await Task.Delay(100, token);
+        }
+        if (selected is null || selected.Current.IsOffscreen || !selected.Current.IsEnabled ||
+            selected.Current.BoundingRectangle.IsEmpty)
+            throw new InvalidOperationException($"Step {step.Number}: Excel Go To did not expose the recorded cell {address} as a visible, enabled cell. It may be hidden by the current filter. No text was entered; review the recorded row target rather than substituting another row.");
+        selected.SetFocus();
+        var focused = Automation.Describe(AutomationElement.FocusedElement);
+        if (focused?.AutomationId?.Equals(address, StringComparison.OrdinalIgnoreCase) != true)
+            throw new InvalidOperationException($"Step {step.Number}: Excel selected '{focused?.AutomationId ?? focused?.Name ?? "unknown"}' instead of {address}.");
+        var desired = DynamicText.Resolve(step.Value!, step.RelativeWeekday);
+        SendKeys.SendWait(string.Concat(desired.Select(EscapeText)));
+        SendKeys.SendWait("^{ENTER}");
+        await Task.Delay(150, token);
+        token.ThrowIfCancellationRequested();
+        var committed = ExcelNativeSheet.Read<string?>(workbook, sheet =>
+        {
+            object? value = sheet.Range[address].Value2;
+            return value?.ToString();
+        });
+        if (!string.Equals(committed, desired, StringComparison.Ordinal))
+            throw new InvalidOperationException($"Step {step.Number}: Excel did not commit '{desired}' to {address}; the live value is '{committed ?? "<empty>"}'. Replay stopped before the next command.");
     }
 
     private static bool FollowsSubmittedNavigation(IReadOnlyList<PlanStep> steps, int index)
@@ -3527,9 +5127,26 @@ internal static class Executor
         return null;
     }
 
-    private static bool FollowsHorizontalScroll(ExecutionPlan plan, int index) =>
-        index > 0 && plan.Steps[index - 1].Action == "scroll" &&
-        plan.Steps[index - 1].Key == "Horizontal";
+    private static bool FollowsHorizontalScroll(ExecutionPlan plan, int index)
+    {
+        var target = plan.Steps[index].Target;
+        for (var previousIndex = index - 1;
+             previousIndex >= Math.Max(0, index - 3); previousIndex--)
+        {
+            var previous = plan.Steps[previousIndex];
+            if (previous.Action == "scroll" && previous.Key == "Horizontal" &&
+                previous.Target?.Process == target?.Process &&
+                previous.Target?.Window == target?.Window)
+                return true;
+            if (previous.Action == "click" &&
+                previous.Target?.ControlType == "ControlType.DataItem" &&
+                previous.Target.Process == target?.Process &&
+                previous.Target.Window == target?.Window)
+                continue;
+            break;
+        }
+        return false;
+    }
 
     private static async Task<(AutomationElement? Element, bool HandledByUser)> RevealTargetWithUiaScrollAsync(PlanStep step,
         Action<string> status, Func<string, bool> handleUnexpectedDialog, CancellationToken token)
@@ -3653,7 +5270,8 @@ internal static class Executor
             try
             {
                 var current = attempt == 0 ? firstElement : await FindAsync(target, token, 2);
-                if (current is not null && TryClickLiveUiaElement(current, null, false, out detail))
+                if (current is not null && current.Current.IsEnabled &&
+                    TryClickLiveUiaElement(current, null, false, out detail))
                     return detail;
                 if (current is null) detail = "the filter control disappeared from UI Automation";
             }
@@ -3678,6 +5296,150 @@ internal static class Executor
         status(help.Replace('\n', ' '));
         if (!handleUnexpectedDialog(help)) throw new OperationCanceledException("Replay stopped by user.", token);
         return "Handled by the user after retries.";
+    }
+
+    private static async Task ApplyExcelFilterAsync(PlanStep step, CancellationToken token)
+    {
+        var target = step.Target ?? throw new InvalidDataException("Missing filter column.");
+        var values = ExcelFilterPlan.Values(step);
+        var mode = step.ExpectedState;
+        if (mode is not ("filter:only" or "filter:exclude" or "filter:all") ||
+            mode == "filter:only" && values.Length == 0)
+            throw new InvalidDataException($"Step {step.Number}: the filter selection is empty or unconfirmed.");
+        var headerAddress = target.ParentName ??
+            throw new InvalidDataException($"Step {step.Number}: the filter has no column header address.");
+        _ = ExcelCellAddress(headerAddress);
+        var workbookHandle = FindDesktopWindow("EXCEL", target.Window);
+        if (workbookHandle == 0)
+            throw new InvalidOperationException($"Step {step.Number}: the filter workbook is unavailable.");
+        ActivateWindow(AutomationElement.FromHandle(workbookHandle));
+        if (GetAncestor(GetForegroundWindow(), 2) != GetAncestor(workbookHandle, 2))
+            throw new InvalidOperationException($"Step {step.Number}: Excel did not take focus for filter navigation.");
+        var header = await NavigateToVerifiedExcelCellAsync(target, headerAddress, token);
+        var headerProcessId = header.Current.ProcessId;
+        SendKeys.SendWait("%{DOWN}");
+        AutomationElement? tree = null;
+        for (var attempt = 0; attempt < 30 && tree is null; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            var roots = AutomationElement.RootElement.FindAll(TreeScope.Children,
+                new PropertyCondition(AutomationElement.ProcessIdProperty, headerProcessId));
+            var matches = new List<AutomationElement>();
+            foreach (AutomationElement root in roots)
+                foreach (AutomationElement item in root.FindAll(TreeScope.Descendants, new AndCondition(
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TreeItem),
+                    new PropertyCondition(AutomationElement.NameProperty, "(Select All)"))))
+                {
+                    if (item.Current.IsEnabled && !item.Current.IsOffscreen &&
+                        TreeWalker.ControlViewWalker.GetParent(item) is { } parent && parent.Current.Name == "Manual Filter")
+                        matches.Add(parent);
+                }
+            if (matches.Count > 1) throw new InvalidOperationException("Multiple live filter lists are open; replay stopped.");
+            tree = matches.SingleOrDefault();
+            if (tree is null) await Task.Delay(100, token);
+        }
+        if (tree is null) throw new InvalidOperationException($"Step {step.Number}: the live filter checklist did not open.");
+        AutomationElement Item(string name)
+        {
+            var matches = tree.FindAll(TreeScope.Descendants, new AndCondition(
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TreeItem),
+                new PropertyCondition(AutomationElement.NameProperty, name)));
+            if (matches.Count != 1) throw new InvalidOperationException($"Filter value '{name}' is missing or ambiguous. No filter was applied.");
+            return matches[0];
+        }
+        if (mode != "filter:all")
+            foreach (var value in values) _ = Item(value);
+        var selectAll = Item("(Select All)");
+        // Start from a verified baseline, not the workbook's previous filter state.
+        await SetExcelFilterCheckAsync(selectAll, mode != "filter:only", token);
+        if (mode != "filter:all")
+            foreach (var value in values)
+                await SetExcelFilterCheckAsync(Item(value), mode == "filter:only", token);
+        var items = tree.FindAll(TreeScope.Descendants,
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TreeItem));
+        var checkedCount = 0;
+        foreach (AutomationElement item in items)
+        {
+            var name = item.Current.Name;
+            if (name == "(Select All)") continue;
+            var expected = mode == "filter:all" || (mode == "filter:only"
+                ? values.Contains(name, StringComparer.Ordinal) : !values.Contains(name, StringComparer.Ordinal));
+            var state = ExcelFilterPlan.CheckState(item);
+            if (state != (expected ? "filter:checked" : "filter:unchecked"))
+                throw new InvalidOperationException($"Step {step.Number}: filter state for '{name}' was not verified. No worksheet input will follow.");
+            if (expected) checkedCount++;
+        }
+        if (checkedCount == 0) throw new InvalidOperationException("The filter has no selected values. Replay stopped before clicking OK.");
+        AutomationElement? ok = null;
+        var container = TreeWalker.ControlViewWalker.GetParent(tree);
+        for (var depth = 0; depth < 5 && container is not null; depth++)
+        {
+            ok = container.FindFirst(TreeScope.Descendants, new AndCondition(
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                new PropertyCondition(AutomationElement.NameProperty, "OK"),
+                new PropertyCondition(AutomationElement.ClassNameProperty, "NetUIButton")));
+            if (ok is not null) break;
+            container = TreeWalker.ControlViewWalker.GetParent(container);
+        }
+        if (ok is null || !ok.Current.IsEnabled || ok.Current.IsOffscreen)
+            throw new InvalidOperationException($"Step {step.Number}: the filter's OK button is unavailable or disabled. Replay stopped; no cell input was sent.");
+        if (!TryClickLiveUiaElement(ok, null, false, out var detail))
+            throw new InvalidOperationException($"Step {step.Number}: could not apply the filter. {detail}");
+        for (var attempt = 0; attempt < 30; attempt++)
+        {
+            await Task.Delay(100, token);
+            try
+            {
+                if (tree.Current.IsOffscreen || !tree.Current.IsEnabled ||
+                    ok.Current.IsOffscreen || !ok.Current.IsEnabled || !IsLiveHitTarget(ok)) return;
+                if (attempt == 9 && !TryClickLiveUiaElement(ok, null, false, out var retryDetail))
+                    throw new InvalidOperationException($"Step {step.Number}: the live filter OK button remained open and its verified retry failed. {retryDetail}");
+            }
+            catch (ElementNotAvailableException) { return; }
+        }
+        throw new InvalidOperationException($"Step {step.Number}: filter OK was clicked, but the checklist remained open. Replay stopped before worksheet input.");
+    }
+
+    private static bool IsLiveHitTarget(AutomationElement element)
+    {
+        var bounds = element.Current.BoundingRectangle;
+        if (bounds.IsEmpty || bounds.Width < 2 || bounds.Height < 2) return false;
+        var hit = AutomationElement.FromPoint(new System.Windows.Point(
+            bounds.Left + bounds.Width / 2, bounds.Top + bounds.Height / 2));
+        for (var current = hit; current is not null; current = TreeWalker.ControlViewWalker.GetParent(current))
+        {
+            try
+            {
+                if (current.GetRuntimeId().SequenceEqual(element.GetRuntimeId())) return true;
+            }
+            catch (ElementNotAvailableException) { return false; }
+        }
+        return false;
+    }
+
+    private static async Task SetExcelFilterCheckAsync(AutomationElement item, bool check, CancellationToken token)
+    {
+        var desired = check ? "filter:checked" : "filter:unchecked";
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            var before = ExcelFilterPlan.CheckState(item)
+                ?? throw new InvalidOperationException($"Filter '{item.Current.Name}' has no accessible checked state.");
+            if (before == desired) return;
+            if (!item.Current.IsEnabled) throw new InvalidOperationException("The filter checklist is disabled.");
+            if (item.TryGetCurrentPattern(TogglePattern.Pattern, out var toggle))
+                ((TogglePattern)toggle).Toggle();
+            else
+            {
+                item.SetFocus();
+                if (!AutomationElement.FocusedElement.GetRuntimeId().SequenceEqual(item.GetRuntimeId()))
+                    throw new InvalidOperationException($"Could not verify keyboard focus on filter '{item.Current.Name}'.");
+                SendKeys.SendWait(" ");
+            }
+            await Task.Delay(150, token);
+        }
+        if (ExcelFilterPlan.CheckState(item) != desired)
+            throw new InvalidOperationException($"Filter '{item.Current.Name}' did not reach its requested checked state.");
     }
 
     private static void Act(AutomationElement element, PlanStep step, bool preserveFocus = false)
@@ -3727,7 +5489,13 @@ internal static class Executor
         else if (actionable.TryGetCurrentPattern(TogglePattern.Pattern, out var toggle))
             ((TogglePattern)toggle).Toggle();
         else if (actionable.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var selection))
-            ((SelectionItemPattern)selection).Select();
+        {
+            var selectable = (SelectionItemPattern)selection;
+            // Native wizard radio buttons can expose SelectionItem while rejecting Select() when
+            // they are already selected. The recorded selection is satisfied in that state.
+            if (!selectable.Current.IsSelected)
+                selectable.Select();
+        }
         else if (actionable.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var expandObject))
         {
             var expand = (ExpandCollapsePattern)expandObject;
@@ -3864,6 +5632,22 @@ internal static class Executor
         expected?.Contains("descending", StringComparison.OrdinalIgnoreCase) == true ? "descending" :
         expected?.Contains("ascending", StringComparison.OrdinalIgnoreCase) == true ? "ascending" : null;
 
+    private static bool IsDatedSheetReference(string template, string? name)
+    {
+        if (name is null) return false;
+        var token = Regex.Match(template, @"\{\{next:[^:}]+:dd MMM yy\}\}");
+        if (!token.Success) return false;
+        var prefix = template[..token.Index];
+        var suffix = template[(token.Index + token.Length)..];
+        if (!name.StartsWith(prefix, StringComparison.Ordinal) ||
+            !name.EndsWith(suffix, StringComparison.Ordinal) ||
+            name.Length < prefix.Length + suffix.Length) return false;
+        return DateTime.TryParseExact(name.Substring(prefix.Length,
+            name.Length - prefix.Length - suffix.Length), "dd MMM yy",
+            System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out _);
+    }
+
     private static async Task<bool> EnsureSortDirectionAsync(AutomationElement header, PlanStep step,
         string desired, CancellationToken token)
     {
@@ -3872,13 +5656,20 @@ internal static class Executor
         {
             token.ThrowIfCancellationRequested();
             var liveHeader = await Task.Run(() => Automation.Resolve(step.Target!) ?? header, token);
-            var observed = await Task.Run(() => ObservedSortDirection(liveHeader), token);
+            string? observed = null;
+            for (var readiness = 0; readiness < 40 && observed is null; readiness++)
+            {
+                token.ThrowIfCancellationRequested();
+                observed = await Task.Run(() => ObservedSortDirection(liveHeader), token);
+                if (observed is null) await Task.Delay(200, token);
+                liveHeader = await Task.Run(() => Automation.Resolve(step.Target!) ?? liveHeader, token);
+            }
             if (observed == desired) return clicked;
             if (attempt == 2)
                 throw new InvalidOperationException($"Step {step.Number}: could not verify {desired} order from visible column values.");
             Act(liveHeader, step with { Action = "click" });
             clicked = true;
-            await Task.Delay(150, token);
+            await Task.Delay(500, token);
         }
         return clicked;
     }
@@ -3985,6 +5776,8 @@ internal static class Executor
         detail = "the target was not hit-testable";
         try
         {
+            if (!element.Current.IsEnabled)
+            { detail = "the live target is disabled"; return false; }
             var bounds = element.Current.BoundingRectangle;
             var targetId = element.GetRuntimeId();
             var candidates = new List<(int X, int Y)>();
@@ -4048,7 +5841,7 @@ internal static class Executor
                 return true;
             }
             detail = candidates.Count == 0 ? "the target and preceding cell have no usable live bounds"
-                : $"no point on the row header matched its UIA identity; target bounds={bounds}; {lastHit ?? "no UIA hit"}";
+                : $"no point on the target matched its UIA identity; target bounds={bounds}; {lastHit ?? "no UIA hit"}";
             return false;
         }
         catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or
@@ -4092,6 +5885,16 @@ internal static class Executor
         catch (Exception e) when (e is ElementNotAvailableException or InvalidOperationException) { return false; }
     }
 
+    private static void EnsureRecordedAllRowSelection(AutomationElement list, PlanStep step, CancellationToken token)
+    {
+        if (step.ExpectedState != "selection-intent:all")
+            throw new InvalidOperationException($"Step {step.Number}: all items are not selected, " +
+                $"and no all-row selection intent was recorded. {ListSelectionDiagnostics(list)}");
+        SelectAllListItemsViaUia(list, token);
+        if (!AllListItemsSelected(list))
+            throw new InvalidOperationException($"Step {step.Number}: could not establish the recorded all-row selection. {ListSelectionDiagnostics(list)}");
+    }
+
     private static void SelectAllListItemsViaUia(AutomationElement list, CancellationToken token)
     {
         var items = list.FindAll(TreeScope.Descendants,
@@ -4124,6 +5927,16 @@ internal static class Executor
 
     internal static string? ObservedSortDirection(AutomationElement header)
     {
+        try
+        {
+            var exposedState = string.Join(' ', header.Current.Name, header.Current.HelpText,
+                header.Current.ItemStatus);
+            if (Regex.IsMatch(exposedState, @"\bdescending\b", RegexOptions.IgnoreCase))
+                return "descending";
+            if (Regex.IsMatch(exposedState, @"\bascending\b", RegexOptions.IgnoreCase))
+                return "ascending";
+        }
+        catch (ElementNotAvailableException) { return null; }
         var match = Regex.Match(header.Current.AutomationId, @"\d+$");
         if (!match.Success) return null;
         var cellId = "ListViewSubItem-" + match.Value;
@@ -4194,10 +6007,10 @@ internal static class Executor
                 var liveValue = Math.Clamp(value, range.Current.Minimum, range.Current.Maximum);
                 if (liveValue != value)
                     status($"Step {step.Number}: recorded scroll value {value} is outside the live range; using {liveValue}.");
+                var before = range.Current.Value;
                 range.SetValue(liveValue);
-                if (liveValue == range.Current.Minimum &&
-                    step.Target?.Process?.Equals("EXCEL", StringComparison.OrdinalIgnoreCase) == true)
-                    EnsureExcelViewportAtOrigin(step.Key, status);
+                if (step.Target?.Process?.Equals("EXCEL", StringComparison.OrdinalIgnoreCase) == true)
+                    ApplyExcelNativeViewportScroll(step, before, liveValue, range.Current.SmallChange, status);
                 return;
             }
             status($"Step {step.Number}: scrollbar range is read only; trying its UI Automation scroll action.");
@@ -4231,11 +6044,92 @@ internal static class Executor
             }
             var delta = int.TryParse(step.Value, out var parsed) ? parsed : 0;
             var amount = delta > 0 ? ScrollAmount.SmallDecrement : ScrollAmount.SmallIncrement;
-            if (step.Key == "Horizontal") scroll.ScrollHorizontal(amount);
-            else scroll.ScrollVertical(amount);
+            var repeats = ScrollRepeatCount(delta);
+            for (var count = 0; count < repeats; count++)
+                if (step.Key == "Horizontal") scroll.ScrollHorizontal(amount);
+                else scroll.ScrollVertical(amount);
             return;
         }
         throw new InvalidOperationException($"Step {step.Number}: target exposes no UI Automation scroll action.");
+    }
+
+    internal static int ScrollRepeatCount(int wheelDelta) =>
+        Math.Max(1, (int)Math.Ceiling(Math.Abs(wheelDelta) / 120.0));
+
+    private static AutomationElement? FindForegroundScrollableContainer(string? processName, string axis)
+    {
+        var handle = GetForegroundWindow();
+        if (handle == 0) return null;
+        GetWindowThreadProcessId(handle, out var processId);
+        try
+        {
+            if (processId == 0 || !string.IsNullOrWhiteSpace(processName) &&
+                !Process.GetProcessById((int)processId).ProcessName.Equals(
+                    processName, StringComparison.OrdinalIgnoreCase)) return null;
+            var window = AutomationElement.FromHandle(handle);
+            var candidates = new[] { window }.Concat(window.FindAll(TreeScope.Descendants,
+                Condition.TrueCondition).Cast<AutomationElement>());
+            foreach (var candidate in candidates)
+            {
+                if (!candidate.TryGetCurrentPattern(ScrollPattern.Pattern, out var pattern)) continue;
+                var state = ((ScrollPattern)pattern).Current;
+                if (axis == "Horizontal" ? state.HorizontallyScrollable : state.VerticallyScrollable)
+                    return candidate;
+            }
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or ArgumentException or
+            InvalidOperationException or COMException or System.ComponentModel.Win32Exception)
+        {
+            Trace.WriteLine("Could not inspect the foreground scroll container: " + ex.Message);
+        }
+        return null;
+    }
+
+    private static bool TryScrollForegroundDocumentWithWheel(string? processName, int wheelDelta,
+        out string detail)
+    {
+        detail = "the foreground document was not verified";
+        var handle = GetForegroundWindow();
+        if (handle == 0 || wheelDelta == 0) return false;
+        GetWindowThreadProcessId(handle, out var processId);
+        try
+        {
+            if (processId == 0 || !string.IsNullOrWhiteSpace(processName) &&
+                !Process.GetProcessById((int)processId).ProcessName.Equals(
+                    processName, StringComparison.OrdinalIgnoreCase)) return false;
+            var window = AutomationElement.FromHandle(handle);
+            var documents = window.FindAll(TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Document));
+            var document = documents.Cast<AutomationElement>().Where(candidate =>
+            {
+                try
+                {
+                    var current = candidate.Current;
+                    return current.IsEnabled && !current.IsOffscreen &&
+                        !current.BoundingRectangle.IsEmpty;
+                }
+                catch (ElementNotAvailableException) { return false; }
+            }).OrderByDescending(candidate =>
+            {
+                var bounds = candidate.Current.BoundingRectangle;
+                return bounds.Width * bounds.Height;
+            }).FirstOrDefault();
+            if (document is null) return false;
+            var rectangle = document.Current.BoundingRectangle;
+            var x = (int)Math.Round(rectangle.Left + rectangle.Width / 2);
+            var y = (int)Math.Round(rectangle.Top + rectangle.Height / 2);
+            if (!SetCursorPos(x, y)) return false;
+            mouse_event(0x0800u, 0, 0, unchecked((uint)wheelDelta), 0);
+            detail = $"sent the recorded {wheelDelta} wheel movement inside the verified foreground document";
+            return true;
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or ArgumentException or
+            InvalidOperationException or COMException or System.ComponentModel.Win32Exception)
+        {
+            Trace.WriteLine("Could not scroll the foreground document with verified wheel input: " + ex.Message);
+            detail = ex.Message;
+            return false;
+        }
     }
 
     private static void EnsureExcelViewportAtOrigin(string? axis, Action<string> status)
@@ -4245,6 +6139,21 @@ internal static class Executor
         if (axis is not ("Vertical" or "Horizontal")) return;
         SendKeys.SendWait("{ESC}^{HOME}");
         status("Excel viewport fallback: moved to the first row and column with Ctrl+Home");
+    }
+
+    private static void ApplyExcelNativeViewportScroll(PlanStep step, double before, double desired,
+        double smallChange, Action<string> status)
+    {
+        if (step.Key is not ("Vertical" or "Horizontal")) return;
+        var handle = FindDesktopWindow("EXCEL", step.Target?.Window);
+        if (handle == 0) throw new InvalidOperationException("Workbook unavailable for verified viewport scrolling.");
+        var direction = desired.CompareTo(before);
+        if (desired == 0) direction = -1;
+        var unit = smallChange > 0 ? smallChange : 1;
+        var amount = Math.Clamp((int)Math.Ceiling(Math.Abs(desired - before) / unit), 1, 50);
+        var result = ExcelNativeSheet.Read<string>(handle, sheet =>
+            ExcelNativeSheet.ScrollViewport(sheet, step.Key, direction, amount));
+        status($"Excel viewport verified through the workbook: {result}");
     }
 
     private static void OpenContextMenu(AutomationElement element, bool preserveFocus = false)
@@ -4270,17 +6179,24 @@ internal static class Executor
         keybd_event(0x5D, 0, 2, 0);
     }
 
-    private static void ActivateWindow(AutomationElement element)
+    internal static void ActivateWindow(AutomationElement element)
     {
         var current = element;
-        while (true)
+        nint handle = 0;
+        while (current is not null && current != AutomationElement.RootElement)
         {
-            var parent = TreeWalker.ControlViewWalker.GetParent(current);
-            if (parent is null || parent == AutomationElement.RootElement) break;
-            current = parent;
+            var nativeHandle = (nint)current.Current.NativeWindowHandle;
+            if (nativeHandle != 0)
+            {
+                // UIA may nest an owned modal dialog under its disabled owner.
+                // GA_ROOT follows native parents, not the owner chain.
+                handle = GetAncestor(nativeHandle, 2);
+                break;
+            }
+            current = TreeWalker.RawViewWalker.GetParent(current);
         }
-        var handle = (nint)current.Current.NativeWindowHandle;
         if (handle == 0) throw new InvalidOperationException("The target window has no native handle to activate.");
+        current = AutomationElement.FromHandle(handle);
         if (GetForegroundWindow() != handle || GetWindow(handle, 4) != 0)
             ShowWindow(handle, 9); // Restore a minimized target.
         MaximizeWindowIfSupported(current, handle);
@@ -4423,7 +6339,7 @@ internal static class Executor
         { "Control" or "Ctrl" => "^", "Shift" => "+", "Alt" => "%", _ => "" }));
         return prefix + (name switch
         { "Enter" or "Return" => "{ENTER}", "Escape" => "{ESC}", "Back" => "{BACKSPACE}",
-          "Delete" => "{DELETE}", "Tab" => "{TAB}", "Up" => "{UP}", "Down" => "{DOWN}",
+          "Insert" => "{INSERT}", "Delete" => "{DELETE}", "Tab" => "{TAB}", "Up" => "{UP}", "Down" => "{DOWN}",
           "Left" => "{LEFT}", "Right" => "{RIGHT}", "Home" => "{HOME}", "End" => "{END}",
           "PageUp" => "{PGUP}", "PageDown" => "{PGDN}", "Space" => " ",
           _ when name.Length == 1 && char.IsLetterOrDigit(name[0]) => name.ToLowerInvariant(),

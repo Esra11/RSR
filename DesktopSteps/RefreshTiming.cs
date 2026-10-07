@@ -4,12 +4,25 @@ namespace DesktopSteps;
 
 internal static class RefreshTiming
 {
+    internal static bool TryExpectedSeconds(string text, out int seconds)
+    {
+        seconds = 0;
+        return Regex.IsMatch(text, @"\A[0-9]+\z") &&
+            int.TryParse(text, out seconds) && seconds > 0 && seconds <= int.MaxValue - 2;
+    }
+
+    internal static bool HasRefreshStep(ExecutionPlan plan) => plan.Steps.Any(step =>
+        step.Action is "click" or "click-if-previous-absent" &&
+        step.Target?.ControlType == "ControlType.Button" &&
+        (step.TargetStrategy == "unique-refresh-command" ||
+         Regex.IsMatch(step.Target.Name ?? "", @"\b(refresh|reload|sync)\b", RegexOptions.IgnoreCase)));
+
     public static ExecutionPlan AddObservedWait(ExecutionPlan plan, IReadOnlyList<RecordedEvent> events)
     {
         var changed = false;
         var steps = plan.Steps.Select(step =>
         {
-            if (step.Action != "click" || step.Target?.ControlType != "ControlType.Button" ||
+            if (step.Action is not ("click" or "click-if-previous-absent") || step.Target?.ControlType != "ControlType.Button" ||
                 !Regex.IsMatch(step.Target.Name ?? "", @"\b(refresh|reload|sync)\b", RegexOptions.IgnoreCase) ||
                 step.Value?.StartsWith("refresh-observed-ms:", StringComparison.Ordinal) == true) return step;
             for (var i = 0; i < events.Count - 1; i++)

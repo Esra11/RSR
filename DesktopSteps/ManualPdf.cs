@@ -6,9 +6,19 @@ namespace DesktopSteps;
 
 internal static class ManualPdf
 {
+    private static string CopyBoundaryDescription(PlanStep step)
+    {
+        if (step.ExpectedState?.StartsWith("copy-stop-values:", StringComparison.Ordinal) != true)
+            return "the first empty cell";
+        var values = System.Text.Json.JsonSerializer.Deserialize<string[]>(
+            step.ExpectedState["copy-stop-values:".Length..])
+            ?? throw new InvalidDataException("Copy stop values are missing.");
+        return "the first empty cell or cell containing " + string.Join(", ", values.Select(value => $"'{value}'"));
+    }
+
     public static async Task CreateAsync(ExecutionPlan plan, string sessionDirectory, string outputPath, CancellationToken token)
     {
-        var manualSteps = ManualSteps(plan.Steps);
+        var manualSteps = plan.Steps.ToList();
         var eventsPath = Path.Combine(sessionDirectory, "recorded_events.json");
         var recordedEvents = File.Exists(eventsPath)
             ? await JsonFile.LoadAsync<List<RecordedEvent>>(eventsPath, token) ?? [] : [];
@@ -47,7 +57,13 @@ internal static class ManualPdf
                 ? step.Target.AutomationId == "18" ? "Find what" :
                   step.Target.AutomationId == "21" ? "Replace with" : null : null);
             var text = step.Action == "type"
-                ? $"Step {step.Number}: Type text in {fieldName ?? step.Target?.Name ?? "the selected control"}"
+                ? step.TargetStrategy == "first-visible-filtered-row"
+                    ? $"Step {step.Number}: Enter text in the first visible filtered row of column {System.Text.RegularExpressions.Regex.Match(step.Target?.AutomationId ?? "", @"^[A-Za-z]+").Value}"
+                    : $"Step {step.Number}: Type text in {fieldName ?? step.Target?.Name ?? "the selected control"}"
+                : step.Action == "optional-click"
+                ? $"Step {step.Number}: If present, click {step.Target?.Name} in {step.Target?.Window}"
+                : step.Action == "click-if-previous-absent"
+                ? $"Step {step.Number}: If the preceding dialog is absent, click {step.Target?.Name}"
                 : step.Action == "manual-click"
                 ? $"Step {step.Number}: Perform the recorded click manually"
                 : step.Action == "manual-menu"
@@ -58,10 +74,24 @@ internal static class ManualPdf
                 ? $"Step {step.Number}: Select {step.Target?.Name ?? "the destination"} and paste"
                 : step.Action == "ensure-state" && step.ExpectedState?.StartsWith("sort:") == true
                 ? $"Step {step.Number}: Sort {step.Target?.Name ?? "the list"} {step.ExpectedState[5..]}"
+                : step.Action == "filter-values"
+                ? $"Step {step.Number}: Filter column {step.Target?.ParentName}"
                 : step.Action == "rename-sheet"
                 ? $"Step {step.Number}: Rename sheet using {(step.RelativeWeekday is null ? step.Value : "next " + step.RelativeWeekday)}"
                 : step.Action == "scroll"
                 ? $"Step {step.Number}: Scroll {step.Key?.ToLowerInvariant()}"
+                : step.Action == "copy-column-until-empty"
+                ? $"Step {step.Number}: Copy {step.Value} down to {CopyBoundaryDescription(step)}"
+                : step.Action == "copy-populated-columns"
+                ? $"Step {step.Number}: Copy populated columns from {step.Value}"
+                : step.Action == "set-chart-source-range"
+                ? $"Step {step.Number}: Restore the recorded data source in {step.Target?.Name}"
+                : step.Action == "set-chart-source-from-last-paste"
+                ? $"Step {step.Number}: Set {step.Value} data to the last pasted range"
+                : step.Action == "set-chart-legend-layout"
+                ? $"Step {step.Number}: Restore the recorded legend layout in {step.Target?.Name}"
+                : step.Action == "extend-formula-to-adjacent-data-end"
+                ? $"Step {step.Number}: Extend the last populated formula in column {step.Value}"
                 : step.Action == "resize-column"
                 ? $"Step {step.Number}: Resize column {step.Target?.Name} by dragging its right edge"
                 : step.Action == "select-first-row"
@@ -75,7 +105,12 @@ internal static class ManualPdf
                 : step.Action == "click"
                 ? $"Step {step.Number}: Click {step.Target?.Name ?? "the recorded control"}"
                 : $"Step {step.Number}: {step.Action} - {step.Target?.Name ?? "unknown control"}";
-            var detail = step.Action == "type" ? step.RelativeWeekday is null
+            var detail = step.Action == "type" && step.TargetStrategy == "first-visible-filtered-row"
+                ? $"Enter: {step.Value}. Navigate horizontally to the recorded column and use the first visible filtered data row, not the old row number. The following fill changes visible rows only." :
+                step.Action == "fill-down-to-adjacent-data-end" &&
+                i > 0 && manualSteps[i - 1].TargetStrategy == "first-visible-filtered-row"
+                ? "Fill only visible filtered rows until the first empty adjacent data cell; leave hidden rows unchanged." :
+                step.Action == "type" ? step.RelativeWeekday is null
                     ? $"Enter: {step.Value}" : $"Enter text using the date of next {step.RelativeWeekday}." :
                 step.Action == "manual-click" ? "The recorder could not verify the clicked control. Use the screenshot to identify the intended target." :
                 step.Action == "manual-menu" ? $"Right-click {(step.ExpectedState?.StartsWith("selection-intent:", StringComparison.Ordinal) == true ? "the current selected rows" : step.Target?.Name ?? "the current selection")}, then click {step.Value}. The screenshot shows the menu before the command was chosen." :
@@ -83,10 +118,23 @@ internal static class ManualPdf
                 step.Action == "manual-paste" ? $"Select {step.Target?.Name ?? "the destination"}, then paste the clipboard contents." :
                 step.Action == "ensure-state" && step.ExpectedState?.StartsWith("sort:") == true
                 ? $"Make the list {step.ExpectedState[5..]} by {step.Target?.Name ?? "the selected column"}; verify the order before continuing." :
+                step.Action == "filter-values" ? step.ExpectedState switch
+                {
+                    "filter:only" => $"Keep only: {string.Join(", ", ExcelFilterPlan.Values(step))}. Verify the checked values, then apply OK.",
+                    "filter:exclude" => $"Keep all values except: {string.Join(", ", ExcelFilterPlan.Values(step))}. Verify the checked values, then apply OK.",
+                    "filter:all" => "Select all values and apply OK to clear this column's filter.",
+                    _ => "The recording did not save final checkbox states. Confirm the filter outcome before replay."
+                } :
                 step.Action == "rename-sheet" ? step.RelativeWeekday is null
                     ? $"Select {step.Target?.Name}, then set its final name to {step.Value}."
                     : $"Select {step.Target?.Name}, then replace the recorded date in its name with the date of next {step.RelativeWeekday}." :
                 step.Action == "scroll" ? $"Move the {step.Key?.ToLowerInvariant()} view to the position shown in the screenshot." :
+                step.Action == "copy-column-until-empty" ? $"Select from {step.Value} down to, but not including, {CopyBoundaryDescription(step)} in that column, then press Ctrl+C. Keep the copied range available for the following paste." :
+                step.Action == "copy-populated-columns" ? $"Select the rectangle starting at {step.Value} down to before the first row where any selected column is empty. Press Ctrl+C and keep both columns available for the following paste." :
+                step.Action == "set-chart-source-range" ? $"Restore the verified category/value source captured after Select Data: {step.Value}. If this starts at the last verified two-column paste, use its entire current range. Verify every category and value." :
+                step.Action == "set-chart-source-from-last-paste" ? $"Replace {step.Value}'s data source with the entire two-column range just pasted on this sheet. Use the first column for categories and the second for values, including the first pasted row. Verify every category and value." :
+                step.Action == "set-chart-legend-layout" ? "Resize and position the legend to match the recorded screenshot. Replay uses recorded dimensions relative to the chart and verifies the resulting layout." :
+                step.Action == "extend-formula-to-adjacent-data-end" ? $"Select {(step.TargetStrategy?.StartsWith("formula-source:", StringComparison.Ordinal) == true ? step.TargetStrategy["formula-source:".Length..] : $"the last populated formula cell in {step.Value}")} down through the last contiguous populated row in {(step.ExpectedState ?? "").Replace("adjacent-column:", "")}, then Fill Down (Ctrl+D). Stop before the empty adjacent cell; verify relative references." :
                 step.Action == "select-first-row" ? "Select the first row, regardless of the data currently shown in it." :
                 step.Action == "select-all-items" ? "Select every item in the list, regardless of the data currently shown in each row." :
                 step.Action == "context-selection" ? "Right-click the current selection, regardless of the text in any item." :
@@ -95,6 +143,8 @@ internal static class ManualPdf
                 detail += "\nNo screenshot of this open submenu was captured. Use the named menu command.";
             else if (image is null)
                 detail += "\nNo screenshot was captured for this step; follow the named action.";
+            if (step.OriginIntent is not null)
+                detail += "\nIntent-generated action, not a captured click. Any screenshot shows its recorded context, not proof this action was performed.";
             if (i == 0)
                 detail += "\nRecording shortcut: Ctrl+Alt+Shift+I adds an intent note; this shortcut is not replayed.";
             if (!string.IsNullOrWhiteSpace(step.Intent))
@@ -133,77 +183,6 @@ internal static class ManualPdf
         await Write($"xref\n0 {offsets.Count}\n0000000000 65535 f \n");
         foreach (var offset in offsets.Skip(1)) await Write($"{offset:0000000000} 00000 n \n");
         await Write($"trailer\n<< /Size {offsets.Count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF");
-    }
-    private static List<PlanStep> ManualSteps(IReadOnlyList<PlanStep> steps)
-    {
-        var ordered = steps.ToList();
-        // Menu providers can report a submenu command before its parent, and
-        // completion timers can insert another application's steps before the
-        // menu choice. Put each choice beside the menu that exposed it in the guide.
-        for (var i = 0; i + 1 < ordered.Count; i++)
-            if (ordered[i] is { Action: "click", Target: { ControlType: "ControlType.MenuItem" } child } &&
-                ordered[i + 1] is { Action: "click", Target: { ControlType: "ControlType.MenuItem" } parent } &&
-                child.Process == parent.Process && child.Window == parent.Window &&
-                child.ParentName == parent.Name)
-                (ordered[i], ordered[i + 1]) = (ordered[i + 1], ordered[i]);
-        for (var i = 0; i < ordered.Count; i++)
-        {
-            var opener = ordered[i];
-            if (opener.Action is not ("context-click" or "context-selection") || opener.Target is null) continue;
-            for (var j = i + 1; j < ordered.Count; j++)
-            {
-                var candidate = ordered[j];
-                if (candidate.Target is { } candidateTarget &&
-                    candidateTarget.Process == opener.Target.Process &&
-                    candidateTarget.Window == opener.Target.Window)
-                {
-                    if (candidate is { Action: "click", Target: { ControlType: "ControlType.MenuItem" } })
-                    {
-                        ordered.RemoveAt(j);
-                        ordered.Insert(i + 1, candidate);
-                    }
-                    break;
-                }
-            }
-        }
-        var result = new List<PlanStep>();
-        for (var i = 0; i < ordered.Count; i++)
-        {
-            var current = ordered[i];
-            var next = i + 1 < ordered.Count ? ordered[i + 1] : null;
-            var third = i + 2 < ordered.Count ? ordered[i + 2] : null;
-            if (current is { Action: "click", Target: { ControlType: "ControlType.Button" } root } &&
-                next is { Action: "click", Target: { ControlType: "ControlType.MenuItem" } parent } &&
-                third is { Action: "click", Target: { ControlType: "ControlType.MenuItem" } child } &&
-                root.Process == parent.Process && parent.Process == child.Process &&
-                parent.Window == child.Window && child.ParentName == parent.Name)
-            {
-                result.Add(current with { Action = "manual-menu-path",
-                    Value = $"{root.Name} > {parent.Name} > {child.Name}",
-                    Screenshot = current.Screenshot });
-                i += 2;
-                continue;
-            }
-            if (current.Action is "context-click" or "context-selection" &&
-                next?.Target?.ControlType == "ControlType.MenuItem" && next.Action == "click")
-            {
-                result.Add(current with { Action = "manual-menu", Value = next.Target.Name,
-                    Screenshot = current.Screenshot });
-                i++;
-                continue;
-            }
-            if (current.Action == "click" && current.Target?.ControlType == "ControlType.DataItem" &&
-                next?.Action == "key" && next.Key is "Control+V" or "Ctrl+V")
-            {
-                result.Add(current with { Action = "manual-paste", Screenshot = next.Screenshot ?? current.Screenshot });
-                i++;
-                continue;
-            }
-            if (current is { Action: "click", Target: { ControlType: "ControlType.MenuItem" } })
-                current = current with { Screenshot = null };
-            result.Add(current);
-        }
-        return result.Select((step, index) => step with { Number = index + 1 }).ToList();
     }
     private static (int X, int Y)? FindMenuPoint(PlanStep step, IReadOnlyList<RecordedEvent> events)
     {

@@ -23,7 +23,8 @@ internal sealed class ReadableButton : Button
             textBounds = new Rectangle(imageX + Image.Width + 4, 0,
                 Math.Max(0, Width - imageX - Image.Width - 8), Height);
         }
-        TextRenderer.DrawText(e.Graphics, Text, Font, textBounds, Color.LightSkyBlue,
+        var disabledText = ForeColor == Color.Red ? Color.Red : Color.LightSkyBlue;
+        TextRenderer.DrawText(e.Graphics, Text, Font, textBounds, disabledText,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
     }
 }
